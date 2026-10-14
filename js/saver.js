@@ -76,3 +76,19 @@ export function makeSaver({ write, onStatus = () => {}, delay = 150, retryMs = 3
     get pending() { return savedGen < gen; },
   };
 }
+
+// 画面を離れるときの決まり。
+// 1. 写真などの作業が終わるのを待つ（waitBusy）
+// 2. 保存する。失敗したら ask() に聞く：'saved'（もう一度で保存できた）／'discard'（保存せずに移る）／false（のこる）
+// 3. 片づけ（afterLeave）は、保存できたときだけ。保存せずに移るときは行わない（保存済みの記録を守るため）
+// 移ってよければ true
+export async function leaveScreen({ saver, ask, waitBusy, afterLeave }) {
+  if (waitBusy) await waitBusy();
+  const result = (await saver.flush()) ? 'saved' : await ask();
+  if (!result) return false;
+  saver.dispose();
+  if (afterLeave && result === 'saved') {
+    try { await afterLeave(); } catch (e) { /* 片づけに失敗しても、移動は止めない */ }
+  }
+  return true;
+}

@@ -19,7 +19,7 @@
 
 ## 構成
 
-- `index.html` … 入口。`css/app.css`、`js/app.js`（画面と操作）、`js/kinds.js`（項目・自動配置。画面に関係しない計算）、`js/sheet.js`（A4シートの組み立て）、`js/db.js`（IndexedDB。DB名 `kiroku-base`、ストア `books` / `sheets` / `photos` / `meta`）、`js/photo.js`（写真を縮める）、`js/saver.js`（保存係：順番に保存・失敗を返す・画面を離れたら書かない）
+- `index.html` … 入口。`css/app.css`、`js/app.js`（画面と操作）、`js/kinds.js`（項目・自動配置。画面に関係しない計算）、`js/sheet.js`（A4シートの組み立て）、`js/db.js`（IndexedDB。DB名 `kiroku-base`、ストア `books` / `sheets` / `photos` / `meta`）、`js/photo.js`（写真を縮める）、`js/saver.js`（保存係：順番に保存・失敗を返す・画面を離れたら書かない。`leaveScreen()` は画面を離れるときの決まり）、`js/records.js`（写真の片づけ・写真の付け方・写真の順番待ち・目標の候補の決まり）
 - `sw.js` … オフライン用の控え。https のときだけ登録（手元では `?sw` を付けたときだけ）。ファイルを足したら `FILES` に追加し、`CACHE` の版を上げる
 - 画面の切りかえは `#/…`（ホーム `#/`、新しい単元 `#/new`、単元 `#/book/ID`、入力 `#/sheet/ID`、様式 `#/layout/book|sheet/ID`、振り返り `#/review/本ID/ページID`、印刷 `#/print/ID`、ごみ箱 `#/trash`）
 - 先生モード：「先生」ボタンを長押し（0.9秒）。状態はメモリだけ（開き直すと解除）
@@ -31,7 +31,7 @@ GitHub Pages：https://konkora780-ux.github.io/kiroku-base/ （konkora780-ux/kir
 ## 動かし方・確認
 
 - プレビュー：`.claude/launch.json` の `kiroku-base`（ポート8795、`python3 -m http.server`）
-- テスト：`npm test`（自動配置・重なり判定・引き継ぎ・目標の表示・数の記録・保存係）
+- テスト：`npm test`（自動配置・重なり判定・引き継ぎ・目標の表示・数の記録・保存係・評価で見つかった3点の再発防止）
 
 ## 状態
 
@@ -40,3 +40,4 @@ GitHub Pages：https://konkora780-ux.github.io/kiroku-base/ （konkora780-ux/kir
 - 2026-10-14：評価（docs/codex-review-2026-10-14.md）を受けて、保存の確実化・様式画面の保存表示・使わない写真の片づけ・null表示・もどす・印刷前の注意を直した。様式のコピー、写真の入れかえ選択、「つぎの記録」で様式を変える流れを追加（設計書14章）。書き出し・戻す機能は相談中。
 - 子要素の入れかえは `fill()` を使う（`replaceChildren` に null を渡すと「null」と表示される）。画面ごとの保存は `screenSaver()` を使う。
 - 2026-10-14：振り返りで1まいずつ確認し、先生モードでページをごみ箱へ入れる機能（もとにもどす付き）を追加。再評価（docs/codex-followup-review-2026-10-14.md）の3点（保存せずに移ったときの写真削除、写真処理中のもどす、目標の候補の保存失敗）を直した（設計書15章）。
+- 2026-10-14：再評価の3点の決まりを `js/records.js`・`leaveScreen()` に分け、再発防止のテスト（tests/records.test.mjs）を追加。写真の片づけは1つのトランザクションで行う。**写真・保存・候補の処理を変えるときは、これらの関数を通し、テストを先に足すこと。**

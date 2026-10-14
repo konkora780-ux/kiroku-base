@@ -7,7 +7,8 @@ import {
 } from './kinds.js';
 import { buildSheet, markOverflow, fitBox } from './sheet.js';
 import { shrinkPhoto } from './photo.js';
-import { makeSaver } from './saver.js';
+import { makeSaver, leaveScreen } from './saver.js';
+import { unusedPhotoIds, addPhotoToPage, makeQueue, makeChoiceEditor } from './records.js';
 
 const $bar = document.getElementById('bar');
 const $view = document.getElementById('view');
@@ -160,7 +161,7 @@ function askSaveFailed(saver) {
 }
 
 // 画面の保存係をつくる。画面を離れるときは保存が終わるまで待ち、失敗したら移動を止める
-// busy：まだ終わっていない作業（写真の保存など）。画面を離れる前に終わるのを待つ
+// busy：まだ終わっていない作業の係（makeQueue）。画面を離れる前に終わるのを待つ
 function screenSaver(write, { afterLeave, busy } = {}) {
   const saver = makeSaver({ write, onStatus: setSave });
   const onHide = () => { if (document.visibilityState === 'hidden') saver.flush(); };
@@ -168,18 +169,21 @@ function screenSaver(write, { afterLeave, busy } = {}) {
   document.addEventListener('visibilitychange', onHide);
   window.addEventListener('pagehide', onPageHide);
   state.leave = async () => {
-    if (busy && busy.size) {
-      toast('写真を保存しています。少し待ってください');
-      await Promise.allSettled([...busy]);
+    const ok = await leaveScreen({
+      saver,
+      ask: () => askSaveFailed(saver),
+      waitBusy: busy ? async () => {
+        if (!busy.busy) return;
+        toast('写真を保存しています。少し待ってください');
+        await busy.idle();
+      } : null,
+      afterLeave, // 保存できたときだけ呼ばれる（保存せずに移ったときは呼ばれない）
+    });
+    if (ok) {
+      document.removeEventListener('visibilitychange', onHide);
+      window.removeEventListener('pagehide', onPageHide);
     }
-    const result = (await saver.flush()) ? 'saved' : await askSaveFailed(saver);
-    if (!result) return false;
-    document.removeEventListener('visibilitychange', onHide);
-    window.removeEventListener('pagehide', onPageHide);
-    saver.dispose();
-    // 片づけなどは、保存できたときだけ（保存せずに移ったときは、画面の中身を信用しない）
-    if (afterLeave && result === 'saved') { try { await afterLeave(); } catch (e) { console.warn(e); } }
-    return true;
+    return ok;
   };
   return saver;
 }
@@ -196,12 +200,8 @@ function releaseURLs() {
 
 // そのページで使っていない写真を消す（外した・入れかえた写真）。入力画面を離れて保存できた後にだけ呼ぶ。
 // 基準は、画面の中身ではなく、保存されているページ（DB）の中身
-async function cleanupPhotos(sheetId) {
-  const saved = await db.get('sheets', sheetId);
-  if (!saved) return;
-  const used = new Set();
-  for (const v of Object.values(saved.values || {})) for (const id of (v && v.photoIds) || []) used.add(id);
-  for (const p of await db.photosOf(sheetId)) if (!used.has(p.id)) await db.remove('photos', p.id);
+function cleanupPhotos(sheetId) {
+  return db.removeUnusedPhotos(sheetId, unusedPhotoIds);
 }
 
 async function loadPhotos(sheetId) {
@@ -394,31 +394,27 @@ function editGoalChoices(book) {
   book.goalChoices = book.goalChoices || [];
   const list = h('div');
   const input = h('input', { class: 'big-input', placeholder: '例：なわとびを10回とぶ', maxlength: '60' });
-  let unsaved = false;
   const note = h('p', { class: 'banner warn hidden', text: '候補を保存できていません。「できた」を押すと、もう一度保存します。' });
-  // 保存できたら true。失敗したら知らせて、未保存の印を残す
-  const persist = async () => {
-    book.updatedAt = new Date().toISOString();
-    try {
-      await db.put('books', book);
-      unsaved = false;
-    } catch (e) {
-      unsaved = true;
-      toast('候補を保存できませんでした。もう一度ためしてください');
-    }
-    note.classList.toggle('hidden', !unsaved);
-    return !unsaved;
+  const editor = makeChoiceEditor({
+    items: book.goalChoices,
+    write: async () => { book.updatedAt = new Date().toISOString(); await db.put('books', book); },
+  });
+  // 保存の結果を画面に出す
+  const showResult = (ok) => {
+    note.classList.toggle('hidden', !editor.unsaved);
+    if (!ok) toast('候補を保存できませんでした。もう一度ためしてください');
+    return ok;
   };
   const draw = () => fill(list, ...(book.goalChoices.length ? book.goalChoices.map((c, i) => h('div', { class: 'cand-edit' },
     h('span', { text: c }),
-    h('button', { class: 'btn small', disabled: i === 0, 'aria-label': '上へ', onclick: () => { const a = book.goalChoices; [a[i - 1], a[i]] = [a[i], a[i - 1]]; persist(); draw(); } }, '↑'),
-    h('button', { class: 'btn small danger', onclick: () => { book.goalChoices.splice(i, 1); persist(); draw(); } }, '✕ けす'))) : [h('p', { class: 'hint', text: 'まだ候補がありません。' })]));
+    h('button', { class: 'btn small', disabled: i === 0, 'aria-label': '上へ', onclick: async () => { const p = editor.moveUp(i); draw(); showResult(await p); } }, '↑'),
+    h('button', { class: 'btn small danger', onclick: async () => { const p = editor.remove(i); draw(); showResult(await p); } }, '✕ けす'))) : [h('p', { class: 'hint', text: 'まだ候補がありません。' })]));
   const add = async () => {
-    const t = input.value.trim();
-    if (!t) return;
-    if (!book.goalChoices.includes(t)) book.goalChoices.push(t);
+    const p = editor.add(input.value);
     draw();
-    if (await persist()) input.value = ''; // 保存できなかったときは、書いた文をのこす
+    const r = await p;
+    showResult(r.ok);
+    if (!r.keepInput) input.value = ''; // 保存できなかったときは、書いた文をのこす
     input.focus();
   };
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
@@ -428,7 +424,7 @@ function editGoalChoices(book) {
     body: h('div', {}, h('p', { class: 'hint', text: 'ここに登録した目標は、記録を書くときに押して選べます（この単元だけ）。' }),
       note, list, h('div', { class: 'row' }, input, h('button', { class: 'btn primary', onclick: add }, '＋ 足す'))),
     buttons: [{ label: 'できた ✓', cls: 'primary', keep: true, onClick: async () => {
-      if (unsaved && !(await persist())) return; // 保存できるまで閉じない
+      if (!showResult(await editor.close())) return; // 保存できるまで閉じない
       closeBox();
       route();
     } }],
@@ -493,8 +489,7 @@ async function sheetView(sheetId) {
   const prevSheet = (await db.sheetsOf(sheet.bookId)).filter((s) => s.no < sheet.no).pop() || null;
 
   const undo = []; // 変更する「前」の中身を積む
-  const busy = new Set(); // 保存中の写真
-  let photoQueue = Promise.resolve();
+  const busy = makeQueue(); // 写真の縮小・保存を1まいずつ順番に
   const saver = screenSaver(async () => {
     sheet.updatedAt = new Date().toISOString();
     await db.put('sheets', sheet);
@@ -512,7 +507,7 @@ async function sheetView(sheetId) {
   }
 
   const undoBtn = h('button', { class: 'btn', disabled: true, onclick: () => {
-    if (busy.size) { toast('写真を保存しています。少し待ってから押してください'); return; }
+    if (busy.busy) { toast('写真を保存しています。少し待ってから押してください'); return; }
     const now = JSON.stringify(sheet.values);
     let snap = undo.pop();
     while (snap === now && undo.length) snap = undo.pop();
@@ -668,27 +663,23 @@ async function sheetView(sheetId) {
           inp.remove();
           if (!f) return;
           // 写真は1まいずつ順番に処理する（同じ欄に続けて足しても、まいすうを守るため）
-          const job = photoQueue.then(() => addPhoto(f));
-          photoQueue = job.catch(() => {});
-          busy.add(job);
-          job.finally(() => busy.delete(job));
+          busy.run(() => addPhoto(f));
         });
         const addPhoto = async (f) => {
           setSave('saving');
           try {
-            const p = await shrinkPhoto(f);
-            const rec = { id: db.newId(), sheetId, blob: p.blob, thumb: p.thumb, width: p.width, height: p.height, createdAt: new Date().toISOString() };
-            await db.put('photos', rec); // 先に写真を保存してから、ページに付ける
-            state.photoURL.set(rec.id, URL.createObjectURL(rec.blob));
-            state.thumbURL.set(rec.id, URL.createObjectURL(rec.thumb));
-            pushUndo();
-            // 処理の間に中身が入れかわっていることがあるので、いまの中身に付ける
-            const cur = sheet.values[id] || (sheet.values[id] = {});
-            const ids = (cur.photoIds || []).slice(0, max);
-            if (slot !== null && slot < ids.length) ids[slot] = rec.id;
-            else if (ids.length >= max) ids[max - 1] = rec.id;
-            else ids.push(rec.id);
-            cur.photoIds = ids;
+            // 処理の間に「もどす」で中身が入れかわることがあるので、付ける先は処理が終わった時点の中身
+            await addPhotoToPage({
+              page: sheet, blockId: id, max, slot, beforeAttach: pushUndo,
+              process: async () => {
+                const p = await shrinkPhoto(f);
+                const rec = { id: db.newId(), sheetId, blob: p.blob, thumb: p.thumb, width: p.width, height: p.height, createdAt: new Date().toISOString() };
+                await db.put('photos', rec); // 先に写真を保存してから、ページに付ける
+                state.photoURL.set(rec.id, URL.createObjectURL(rec.blob));
+                state.thumbURL.set(rec.id, URL.createObjectURL(rec.thumb));
+                return rec.id;
+              },
+            });
             if (!(await changed(true))) toast('保存できませんでした。もう一度ためしています');
             drawPhotos();
           } catch (e) {

@@ -88,6 +88,20 @@ export async function photosOf(sheetId) {
   return byIndex('photos', 'sheetId', sheetId);
 }
 
+// 使っていない写真を消す。ページの読み取りと写真の削除を、1つのまとまり（トランザクション）で行う。
+// pick(保存されているページ, そのページの写真idの一覧) が、消す写真のidを返す
+export async function removeUnusedPhotos(sheetId, pick) {
+  const db = await open();
+  const tx = db.transaction(['sheets', 'photos'], 'readwrite');
+  const photos = tx.objectStore('photos');
+  const [sheet, ids] = await Promise.all([
+    result(tx.objectStore('sheets').get(sheetId)),
+    result(photos.index('sheetId').getAllKeys(sheetId)),
+  ]);
+  for (const id of pick(sheet, ids)) photos.delete(id);
+  await done(tx);
+}
+
 // ごみ箱を経由しない本当の削除（ごみ箱を空にするときだけ使う）
 export async function purgeSheet(sheetId) {
   for (const p of await photosOf(sheetId)) await remove('photos', p.id);
