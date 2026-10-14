@@ -113,6 +113,16 @@ export async function purgeBook(bookId) {
   await remove('books', bookId);
 }
 
+// 設定（meta）の読み書き
+export async function getMeta(key) {
+  const row = await get('meta', key);
+  return row ? row.value : null;
+}
+
+export async function setMeta(key, value) {
+  await put('meta', { key, value });
+}
+
 // ブラウザに「このデータを消さないで」と申し出る
 export async function askPersist() {
   try {

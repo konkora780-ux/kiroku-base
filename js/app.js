@@ -9,6 +9,10 @@ import { buildSheet, markOverflow, fitBox } from './sheet.js';
 import { shrinkPhoto } from './photo.js';
 import { makeSaver, leaveScreen } from './saver.js';
 import { unusedPhotoIds, addPhotoToPage, makeQueue, makeChoiceEditor } from './records.js';
+import {
+  makeZip, readZip, buildManifest, validateBackup, planMerge, applyMerge, backupFileName,
+  MANIFEST, photoPath, thumbPath,
+} from './backup.js';
 
 const $bar = document.getElementById('bar');
 const $view = document.getElementById('view');
@@ -275,13 +279,181 @@ async function home() {
   if (state.teacher) {
     const est = await db.usage();
     const persisted = navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted().catch(() => null) : null;
+    const last = await db.getMeta('lastExport').catch(() => null);
     foot.append(h('div', { class: 'teacher-tools' },
       h('button', { class: 'btn', onclick: () => go('#/trash') }, '🗑 ごみ箱'),
+      h('button', { class: 'btn', disabled: !books.length, onclick: () => exportBackup(null) }, '💾 記録を書き出す（控え）'),
+      h('button', { class: 'btn', onclick: importBackup }, '📥 控えから戻す'),
       h('span', { text: `保存の守り：${persisted ? 'あり' : persisted === false ? 'なし' : '不明'}` }),
-      est ? h('span', { text: `使用量：${(est.usage / 1048576).toFixed(1)}MB` }) : null));
+      est ? h('span', { text: `使用量：${(est.usage / 1048576).toFixed(1)}MB` }) : null),
+    h('div', { class: last ? 'hint' : 'banner warn' }, lastExportText(last)));
   }
   parts.push(foot);
   fill($view, ...parts);
+}
+
+// ---------- 書き出し（控え）・控えから戻す（先生モード） ----------
+
+function daysAgo(iso) {
+  const d = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+  return d <= 0 ? '今日' : `${d}日前`;
+}
+
+function lastExportText(last) {
+  const where = 'iPadの中（「ファイル」アプリ）に置いた控えは、iPadを初期化すると一緒に消えます。初期化や交換の前には、控えをほかの場所へ移してください。';
+  if (!last) return `まだ記録を書き出していません。「💾 記録を書き出す」で控えを作れます。${where}`;
+  return `最後の書き出し：${daysAgo(last.at)}（${last.scope === 'book' ? `単元「${last.title}」` : '全部'}）。${where}`;
+}
+
+// 控えのファイルを作り、iPadの共有画面で保存してもらう（bookId があればその単元だけ）
+async function exportBackup(bookId) {
+  const busyBox = modal({ title: '控えを作っています…', body: '写真が多いと、少し時間がかかります。' });
+  let file;
+  let book = null;
+  try {
+    const books = bookId ? [await db.get('books', bookId)] : await db.all('books');
+    book = bookId ? books[0] : null;
+    const sheets = bookId ? await db.sheetsOf(bookId, { withDeleted: true }) : await db.all('sheets');
+    const ids = new Set(sheets.map((s) => s.id));
+    const photos = (await db.all('photos')).filter((p) => ids.has(p.sheetId));
+    const now = new Date().toISOString();
+    const manifest = buildManifest({
+      books, sheets, now, scope: bookId ? 'book' : 'all',
+      photos: photos.map((p) => ({ ...p, hasThumb: !!p.thumb })),
+    });
+    const entries = [{ name: MANIFEST, data: new TextEncoder().encode(JSON.stringify(manifest)) }];
+    for (const p of photos) {
+      entries.push({ name: photoPath(p.id), data: new Uint8Array(await p.blob.arrayBuffer()) });
+      if (p.thumb) entries.push({ name: thumbPath(p.id), data: new Uint8Array(await p.thumb.arrayBuffer()) });
+    }
+    const name = backupFileName(todayISO(), book && book.title);
+    file = new File(makeZip(entries), name, { type: 'application/zip' });
+    busyBox();
+    // 共有画面は「押した直後」でないと開けないので、もう一度押してもらう
+    const size = file.size >= 1048576 ? `${(file.size / 1048576).toFixed(1)}MB` : `${Math.max(1, Math.round(file.size / 1024))}KB`;
+    modal({
+      title: '控えができました',
+      body: h('div', {},
+        h('p', { text: `${book ? `単元「${book.title}」` : '全部の記録'}：ページ${sheets.length}まい・写真${photos.length}まい（${size}）` }),
+        h('p', { text: '「保存する」を押すと、iPadの共有画面が開きます。「"ファイル"に保存」を選び、保存先を決めてください。' }),
+        h('p', { class: 'hint', text: 'ファイルには子どもの写真が入ります（名前は入りません）。学校のきまりに合った場所に保存してください。' })),
+      buttons: [
+        { label: 'やめる' },
+        { label: '💾 保存する', cls: 'primary', onClick: () => saveBackupFile(file, now, book) },
+      ],
+    });
+  } catch (e) {
+    busyBox();
+    console.error(e);
+    toast('控えを作れませんでした。iPadの空き容量を確かめてください');
+  }
+}
+
+async function saveBackupFile(file, at, book) {
+  const record = () => db.setMeta('lastExport', { at, scope: book ? 'book' : 'all', title: book ? book.title : null }).catch(() => {});
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: file.name });
+      await record();
+      toast('控えを保存しました');
+      route();
+    } catch (e) {
+      if (e && e.name === 'AbortError') toast('保存をやめました');
+      else toast('共有画面を開けませんでした。もう一度ためしてください');
+    }
+    return;
+  }
+  // 共有画面が使えないとき（パソコンのブラウザなど）は、ダウンロードにする
+  const url = URL.createObjectURL(file);
+  const a = h('a', { href: url, download: file.name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  await record();
+  toast('控えをダウンロードしました');
+  route();
+}
+
+// 控えのファイルを選んで、今のiPadの記録と「合わせる」
+function importBackup() {
+  const inp = h('input', { type: 'file', accept: '.zip,application/zip', class: 'hidden' });
+  inp.addEventListener('change', async () => {
+    const f = inp.files && inp.files[0];
+    inp.remove();
+    if (!f) return;
+    let files;
+    let manifest;
+    try {
+      files = readZip(new Uint8Array(await f.arrayBuffer()));
+      const m = files.get(MANIFEST);
+      if (!m) throw new Error('記録ベースの控えではありません');
+      manifest = JSON.parse(new TextDecoder().decode(m));
+    } catch (e) {
+      modal({ title: '控えを読めませんでした', body: e.message || 'ファイルが読めませんでした', buttons: [{ label: 'とじる', cls: 'primary' }] });
+      return;
+    }
+    const check = validateBackup(manifest, (name) => files.has(name));
+    if (!check.ok) {
+      modal({ title: '控えを読めませんでした', body: h('div', {}, ...check.errors.map((t) => h('p', { text: `・${t}` }))), buttons: [{ label: 'とじる', cls: 'primary' }] });
+      return;
+    }
+    const local = { books: await db.all('books'), sheets: await db.all('sheets') };
+    const plan = planMerge(local, manifest);
+    const sm = plan.summary;
+    const lines = [
+      `控えを作った日：${formatDate((manifest.exportedAt || '').slice(0, 10))}（${manifest.scope === 'book' ? '単元ごと' : '全部'}）`,
+      `新しく入る：単元${sm.addBooks}・ページ${sm.addSheets}まい`,
+      sm.useIncoming ? `控えのほうが新しいページ：${sm.useIncoming}まい（今のほうは、ごみ箱に入れます）` : null,
+      sm.keepLocal ? `今のほうが新しいページ：${sm.keepLocal}まい（控えのほうは、ごみ箱に入れます）` : null,
+      sm.sameSheets ? `同じページ：${sm.sameSheets}まい（そのまま）` : null,
+    ].filter(Boolean);
+    modal({
+      title: '控えから戻しますか？',
+      body: h('div', {},
+        ...lines.map((t) => h('p', { text: t })),
+        h('p', { class: 'hint', text: '今のiPadの記録は消えません。足りない記録を足し、同じページは新しいほうを残します。' })),
+      buttons: [
+        { label: 'やめる' },
+        { label: '📥 戻す', cls: 'primary', onClick: () => runImport(plan, manifest, files) },
+      ],
+    });
+  });
+  document.body.append(inp);
+  inp.click();
+}
+
+async function runImport(plan, manifest, files) {
+  const busyBox = modal({ title: '控えから戻しています…', body: 'しばらくお待ちください。' });
+  const incomingPhotos = new Map(manifest.photos.map((p) => [p.id, {
+    meta: { id: p.id, sheetId: p.sheetId, width: p.width, height: p.height, createdAt: p.createdAt },
+    blob: new Blob([files.get(p.file)], { type: 'image/jpeg' }),
+    thumb: p.thumb && files.get(p.thumb) ? new Blob([files.get(p.thumb)], { type: 'image/jpeg' }) : null,
+  }]));
+  const store = {
+    putBook: (b) => db.put('books', b),
+    putSheet: (s) => db.put('sheets', s),
+    putPhoto: (p) => db.put('photos', p),
+    getPhoto: (id) => db.get('photos', id),
+    photosOf: (sheetId) => db.photosOf(sheetId),
+    removePhoto: (id) => db.remove('photos', id),
+  };
+  try {
+    const r = await applyMerge(plan, { store, incomingPhotos, newId: db.newId, now: new Date().toISOString() });
+    busyBox();
+    modal({
+      title: '控えから戻しました',
+      body: h('div', {},
+        h('p', { text: `足した単元：${r.addBooks}　足したページ：${r.addSheets}まい` }),
+        r.useIncoming || r.keepLocal ? h('p', { text: `同じページで、もう一方の版をごみ箱に入れました：${r.useIncoming + r.keepLocal}まい` }) : null),
+      buttons: [{ label: 'とじる', cls: 'primary', onClick: () => route() }],
+    });
+  } catch (e) {
+    busyBox();
+    console.error(e);
+    // 途中までに入った記録は消さない（写真→ページの順に入れているので、こわれたページはできない）
+    modal({ title: '途中までしか戻せませんでした', body: 'iPadの空き容量が少ないかもしれません。空きを作ってから、もう一度「控えから戻す」をしてください（同じ控えを何度戻しても、ふえません）。', buttons: [{ label: 'とじる', cls: 'primary', onClick: () => route() }] });
+  }
 }
 
 // ---------- 画面：新しい単元 ----------
@@ -362,7 +534,8 @@ async function bookView(bookId) {
       book.deletedAt = new Date().toISOString();
       await db.put('books', book);
       go('#/');
-    } }, '🗑 単元をごみ箱へ')) : null;
+    } }, '🗑 単元をごみ箱へ'),
+    h('button', { class: 'btn', onclick: () => exportBackup(bookId) }, '💾 この単元を書き出す')) : null;
 
   const list = h('div', { class: 'cards pages' });
   for (const s of [...sheets].reverse()) {
@@ -1086,7 +1259,7 @@ async function trashView() {
   const restore = async (store, obj) => { delete obj.deletedAt; await db.put(store, obj); toast('元にもどしました'); route(); };
   const rows = [
     ...dBooks.map((b) => h('div', { class: 'trash-row' }, h('span', { text: `📘 単元「${b.title}」` }), h('button', { class: 'btn primary', onclick: () => restore('books', b) }, 'もとにもどす'))),
-    ...dSheets.map((s) => h('div', { class: 'trash-row' }, h('span', { text: `📄 「${titleOf(s.bookId)}」${s.no}まいめ ${sheetTitle(s)}` }), h('button', { class: 'btn primary', onclick: () => restore('sheets', s) }, 'もとにもどす'))),
+    ...dSheets.map((s) => h('div', { class: 'trash-row' }, h('span', { text: `📄 「${titleOf(s.bookId)}」${s.no}まいめ ${sheetTitle(s)}${s.copyOf ? '（控えから戻したときの、もう一方の版）' : ''}` }), h('button', { class: 'btn primary', onclick: () => restore('sheets', s) }, 'もとにもどす'))),
   ];
   fill($view, 
     h('p', { class: 'hint', text: 'ごみ箱に入れた単元やページは、ここから元にもどせます。' }),
