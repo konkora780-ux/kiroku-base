@@ -1,7 +1,7 @@
 // 電波がなくてもアプリを開けるようにする控え。
 // 控えをすぐ使って画面を出し、裏で新しい版を取りに行く（次に開いたときに新しい版になる）。
 // 記録の中身（IndexedDB）はここでは扱わない。
-const CACHE = 'kiroku-base-v3';
+const CACHE = 'kiroku-base-v4';
 const FILES = [
   './',
   './index.html',

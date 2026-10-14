@@ -140,7 +140,8 @@ function setSave(s) {
 
 // ---------- 保存（画面ごと） ----------
 
-// 保存に失敗したまま画面を離れようとしたときに聞く。true なら移ってよい
+// 保存に失敗したまま画面を離れようとしたときに聞く。
+// 'saved'（もう一度で保存できた）／'discard'（保存せずに移る）／false（この画面にのこる）
 function askSaveFailed(saver) {
   return new Promise((resolve) => {
     const ask = () => modal({
@@ -148,9 +149,9 @@ function askSaveFailed(saver) {
       body: 'iPadの空き容量が少ないなどの理由で、保存できませんでした。「もう一度」を押してください。',
       buttons: [
         { label: 'この画面にのこる', onClick: () => resolve(false) },
-        { label: '保存せずに移る（最後の変更は消えます）', cls: 'danger', onClick: () => resolve(true) },
+        { label: '保存せずに移る（最後の変更は消えます）', cls: 'danger', onClick: () => resolve('discard') },
         { label: 'もう一度', cls: 'primary', onClick: async () => {
-          if (await saver.flush()) { toast('保存しました'); resolve(true); } else ask();
+          if (await saver.flush()) { toast('保存しました'); resolve('saved'); } else ask();
         } },
       ],
     });
@@ -171,12 +172,13 @@ function screenSaver(write, { afterLeave, busy } = {}) {
       toast('写真を保存しています。少し待ってください');
       await Promise.allSettled([...busy]);
     }
-    const ok = (await saver.flush()) || (await askSaveFailed(saver));
-    if (!ok) return false;
+    const result = (await saver.flush()) ? 'saved' : await askSaveFailed(saver);
+    if (!result) return false;
     document.removeEventListener('visibilitychange', onHide);
     window.removeEventListener('pagehide', onPageHide);
     saver.dispose();
-    if (afterLeave) { try { await afterLeave(); } catch (e) { console.warn(e); } }
+    // 片づけなどは、保存できたときだけ（保存せずに移ったときは、画面の中身を信用しない）
+    if (afterLeave && result === 'saved') { try { await afterLeave(); } catch (e) { console.warn(e); } }
     return true;
   };
   return saver;
@@ -192,11 +194,14 @@ function releaseURLs() {
   }
 }
 
-// そのページで使っていない写真を消す（外した・入れかえた写真）。入力画面を離れて保存できた後にだけ呼ぶ
-async function cleanupPhotos(sheet) {
+// そのページで使っていない写真を消す（外した・入れかえた写真）。入力画面を離れて保存できた後にだけ呼ぶ。
+// 基準は、画面の中身ではなく、保存されているページ（DB）の中身
+async function cleanupPhotos(sheetId) {
+  const saved = await db.get('sheets', sheetId);
+  if (!saved) return;
   const used = new Set();
-  for (const v of Object.values(sheet.values || {})) for (const id of (v && v.photoIds) || []) used.add(id);
-  for (const p of await db.photosOf(sheet.id)) if (!used.has(p.id)) await db.remove('photos', p.id);
+  for (const v of Object.values(saved.values || {})) for (const id of (v && v.photoIds) || []) used.add(id);
+  for (const p of await db.photosOf(sheetId)) if (!used.has(p.id)) await db.remove('photos', p.id);
 }
 
 async function loadPhotos(sheetId) {
@@ -345,6 +350,7 @@ async function bookView(bookId) {
     h('button', { class: 'btn primary huge', onclick: () => nextSheet(book) }, '＋ つぎの記録をつくる'),
     h('button', { class: 'btn huge', disabled: !sheets.length, onclick: () => go(`#/review/${bookId}/${sheets[sheets.length - 1].id}`) }, '📖 ふりかえる'));
   const tools = state.teacher ? h('div', { class: 'teacher-tools' },
+    h('button', { class: 'btn', disabled: !sheets.length, onclick: () => go(`#/review/${bookId}/${sheets[0].id}`) }, '📋 1まいずつ確認・整理'),
     h('button', { class: 'btn', onclick: () => go(`#/layout/book/${bookId}`) }, '🧩 様式を変える'),
     book.template.blocks.some((b) => b.kind === 'goal') ? h('button', { class: 'btn', onclick: () => editGoalChoices(book) }, '🎯 目標の候補') : null,
     h('button', { class: 'btn', onclick: async () => {
@@ -388,30 +394,44 @@ function editGoalChoices(book) {
   book.goalChoices = book.goalChoices || [];
   const list = h('div');
   const input = h('input', { class: 'big-input', placeholder: '例：なわとびを10回とぶ', maxlength: '60' });
+  let unsaved = false;
+  const note = h('p', { class: 'banner warn hidden', text: '候補を保存できていません。「できた」を押すと、もう一度保存します。' });
+  // 保存できたら true。失敗したら知らせて、未保存の印を残す
   const persist = async () => {
     book.updatedAt = new Date().toISOString();
-    try { await db.put('books', book); } catch (e) { toast('候補を保存できませんでした。もう一度ためしてください'); }
+    try {
+      await db.put('books', book);
+      unsaved = false;
+    } catch (e) {
+      unsaved = true;
+      toast('候補を保存できませんでした。もう一度ためしてください');
+    }
+    note.classList.toggle('hidden', !unsaved);
+    return !unsaved;
   };
   const draw = () => fill(list, ...(book.goalChoices.length ? book.goalChoices.map((c, i) => h('div', { class: 'cand-edit' },
     h('span', { text: c }),
     h('button', { class: 'btn small', disabled: i === 0, 'aria-label': '上へ', onclick: () => { const a = book.goalChoices; [a[i - 1], a[i]] = [a[i], a[i - 1]]; persist(); draw(); } }, '↑'),
     h('button', { class: 'btn small danger', onclick: () => { book.goalChoices.splice(i, 1); persist(); draw(); } }, '✕ けす'))) : [h('p', { class: 'hint', text: 'まだ候補がありません。' })]));
-  const add = () => {
+  const add = async () => {
     const t = input.value.trim();
     if (!t) return;
     if (!book.goalChoices.includes(t)) book.goalChoices.push(t);
-    input.value = '';
-    persist();
     draw();
+    if (await persist()) input.value = ''; // 保存できなかったときは、書いた文をのこす
     input.focus();
   };
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
   draw();
-  modal({
+  const closeBox = modal({
     title: '🎯 目標の候補', wide: true,
     body: h('div', {}, h('p', { class: 'hint', text: 'ここに登録した目標は、記録を書くときに押して選べます（この単元だけ）。' }),
-      list, h('div', { class: 'row' }, input, h('button', { class: 'btn primary', onclick: add }, '＋ 足す'))),
-    buttons: [{ label: 'できた ✓', cls: 'primary', onClick: () => route() }],
+      note, list, h('div', { class: 'row' }, input, h('button', { class: 'btn primary', onclick: add }, '＋ 足す'))),
+    buttons: [{ label: 'できた ✓', cls: 'primary', keep: true, onClick: async () => {
+      if (unsaved && !(await persist())) return; // 保存できるまで閉じない
+      closeBox();
+      route();
+    } }],
   });
 }
 
@@ -474,11 +494,12 @@ async function sheetView(sheetId) {
 
   const undo = []; // 変更する「前」の中身を積む
   const busy = new Set(); // 保存中の写真
+  let photoQueue = Promise.resolve();
   const saver = screenSaver(async () => {
     sheet.updatedAt = new Date().toISOString();
     await db.put('sheets', sheet);
     await touchBook(sheet.bookId);
-  }, { afterLeave: () => cleanupPhotos(sheet), busy });
+  }, { afterLeave: () => cleanupPhotos(sheet.id), busy });
   // 書いたらすぐ保存（0.15秒だけまとめる）。now なら待たずに保存し、結果（true/false）を返す
   const changed = (now = false) => saver.changed(now);
   // 変更の直前に呼ぶ。同じ中身は積まない
@@ -491,6 +512,7 @@ async function sheetView(sheetId) {
   }
 
   const undoBtn = h('button', { class: 'btn', disabled: true, onclick: () => {
+    if (busy.size) { toast('写真を保存しています。少し待ってから押してください'); return; }
     const now = JSON.stringify(sheet.values);
     let snap = undo.pop();
     while (snap === now && undo.length) snap = undo.pop();
@@ -510,7 +532,7 @@ async function sheetView(sheetId) {
       sheet.deletedAt = new Date().toISOString();
       if (!(await changed(true))) { delete sheet.deletedAt; toast('保存できなかったので、ごみ箱に入れていません'); return; }
       go(`#/book/${sheet.bookId}`);
-    } }, '🗑'));
+    } }, '🗑 ごみ箱へ'));
   }
   setBar({ back: () => go(`#/book/${sheet.bookId}`), title: `${book.title}　${sheet.no}まいめ`, actions, save: true });
   setSave('saved');
@@ -614,19 +636,20 @@ async function sheetView(sheetId) {
       const max = b.photoCount || 1;
       const shown = h('div', { class: 'photo-list' });
       const drawPhotos = () => {
-        const ids = v.photoIds || [];
+        const cur = sheet.values[id] || {};
+        const ids = cur.photoIds || [];
         fill(shown, ...(ids.length ? ids.slice(0, max).map((pid, i) => h('div', { class: 'photo-item' },
           h('img', { src: state.photoURL.get(pid) || '', alt: '写真' }),
           h('button', { class: 'btn small', onclick: () => {
             pushUndo();
-            v.photoIds = ids.filter((_, j) => j !== i);
+            (sheet.values[id] || (sheet.values[id] = {})).photoIds = ids.filter((_, j) => j !== i);
             changed(true);
             drawPhotos();
           } }, '✕ はずす'))) : [h('p', { class: 'hint', text: 'まだ写真がありません' })]));
       };
       // slot：入れかえる写真の番号（null なら後ろに足す）
       const pick = (capture, slot = null) => {
-        const ids0 = (v.photoIds || []).slice(0, max);
+        const ids0 = ((sheet.values[id] || {}).photoIds || []).slice(0, max);
         if (slot === null && ids0.length >= max) {
           if (max === 1) return pick(capture, 0);
           // いっぱいのときは、どれと入れかえるか選んでもらう
@@ -644,7 +667,9 @@ async function sheetView(sheetId) {
           const f = inp.files && inp.files[0];
           inp.remove();
           if (!f) return;
-          const job = addPhoto(f);
+          // 写真は1まいずつ順番に処理する（同じ欄に続けて足しても、まいすうを守るため）
+          const job = photoQueue.then(() => addPhoto(f));
+          photoQueue = job.catch(() => {});
           busy.add(job);
           job.finally(() => busy.delete(job));
         });
@@ -657,9 +682,13 @@ async function sheetView(sheetId) {
             state.photoURL.set(rec.id, URL.createObjectURL(rec.blob));
             state.thumbURL.set(rec.id, URL.createObjectURL(rec.thumb));
             pushUndo();
-            const ids = (v.photoIds || []).slice(0, max);
-            if (slot !== null && slot < ids.length) ids[slot] = rec.id; else ids.push(rec.id);
-            v.photoIds = ids;
+            // 処理の間に中身が入れかわっていることがあるので、いまの中身に付ける
+            const cur = sheet.values[id] || (sheet.values[id] = {});
+            const ids = (cur.photoIds || []).slice(0, max);
+            if (slot !== null && slot < ids.length) ids[slot] = rec.id;
+            else if (ids.length >= max) ids[max - 1] = rec.id;
+            else ids.push(rec.id);
+            cur.photoIds = ids;
             if (!(await changed(true))) toast('保存できませんでした。もう一度ためしています');
             drawPhotos();
           } catch (e) {
@@ -941,6 +970,39 @@ async function reviewView(bookId, sheetId) {
   await loadPhotos(sheet.id);
 
   const goto = (j) => { if (j >= 0 && j < sheets.length) location.replace(`#/review/${bookId}/${sheets[j].id}`); };
+
+  // 先生モード：このページをごみ箱へ入れて、となりのページを出す
+  const trashThis = async () => {
+    const label = [sheetTitle(sheet), formatDate(sheetDate(sheet))].filter(Boolean).join('　');
+    if (!(await confirmBox(`${sheet.no}まいめをごみ箱へ`, `${label ? `「${label}」の` : ''}ページをごみ箱に入れます。ごみ箱から元にもどせます。`, 'ごみ箱へ'))) return;
+    sheet.deletedAt = new Date().toISOString();
+    try {
+      await db.put('sheets', sheet);
+      await touchBook(bookId);
+    } catch (e) {
+      delete sheet.deletedAt;
+      toast('保存できなかったので、ごみ箱に入れていません');
+      return;
+    }
+    state.lastTrashed = { id: sheet.id, bookId, no: sheet.no };
+    const rest = sheets.filter((x) => x.id !== sheet.id);
+    if (!rest.length) return location.replace(`#/book/${bookId}`);
+    const nextOne = rest[Math.min(i, rest.length - 1)];
+    location.replace(`#/review/${bookId}/${nextOne.id}`);
+  };
+  // ごみ箱に入れた直後だけ、「もとにもどす」を出す
+  const trashed = state.lastTrashed && state.lastTrashed.bookId === bookId ? state.lastTrashed : null;
+  state.lastTrashed = null;
+  const undoBar = trashed ? h('div', { class: 'banner info' },
+    h('span', { text: `${trashed.no}まいめをごみ箱に入れました。` }),
+    h('button', { class: 'btn', onclick: async () => {
+      const t = await db.get('sheets', trashed.id);
+      if (!t) return;
+      delete t.deletedAt;
+      try { await db.put('sheets', t); } catch (e) { toast('もとにもどせませんでした。もう一度ためしてください'); return; }
+      toast(`${trashed.no}まいめを元にもどしました`);
+      location.replace(`#/review/${bookId}/${t.id}`);
+    } }, '↶ もとにもどす')) : null;
   setBar({
     back: () => go(`#/book/${bookId}`), title: `${book.title}　ふりかえり`,
     actions: [h('button', { class: 'btn', onclick: () => go(`#/print/${sheet.id}`) }, '🖨 印刷')],
@@ -955,11 +1017,13 @@ async function reviewView(bookId, sheetId) {
     strip.append(h('button', { class: `strip-item${j === i ? ' on' : ''}`, onclick: () => goto(j) },
       t ? h('img', { src: t, alt: '' }) : h('span', { text: '📄' }), h('span', { text: `${s.no}` })));
   }
-  fill($view, 
+  fill($view,
+    undoBar,
     h('div', { class: 'review' }, prev, stage, next),
     h('div', { class: 'review-foot' },
       h('div', { class: 'page-count', text: `${i + 1} / ${sheets.length}` }),
-      h('button', { class: 'btn primary', onclick: () => go(`#/sheet/${sheet.id}`) }, `✏️ ${sheet.no}まいめに書き足す`)),
+      h('button', { class: 'btn primary', onclick: () => go(`#/sheet/${sheet.id}`) }, `✏️ ${sheet.no}まいめに書き足す`),
+      state.teacher ? h('button', { class: 'btn danger', onclick: trashThis }, `🗑 ${sheet.no}まいめをごみ箱へ`) : null),
     strip);
 
   const s = buildSheet({ unitTitle: book.title, no: sheet.no, layout: sheet.layout, values: sheet.values, photoURL: (id) => state.photoURL.get(id), mode: 'view' });
