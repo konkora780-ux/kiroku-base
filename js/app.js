@@ -7,6 +7,7 @@ import {
 } from './kinds.js';
 import { buildSheet, markOverflow, fitBox } from './sheet.js';
 import { shrinkPhoto } from './photo.js';
+import { makeSaver } from './saver.js';
 
 const $bar = document.getElementById('bar');
 const $view = document.getElementById('view');
@@ -35,6 +36,11 @@ function h(tag, props = {}, ...kids) {
   }
   for (const c of kids.flat()) if (c != null && c !== false) e.append(c.nodeType ? c : document.createTextNode(String(c)));
   return e;
+}
+
+// 子要素を入れかえる（null・false は飛ばす。replaceChildren に直接わたすと「null」と表示されるため）
+function fill(node, ...kids) {
+  node.replaceChildren(...kids.flat().filter((k) => k != null && k !== false));
 }
 
 let toastTimer;
@@ -115,7 +121,7 @@ function teacherButton() {
 }
 
 function setBar({ back, title, actions = [], save = false }) {
-  $bar.replaceChildren(
+  fill($bar, 
     h('div', { class: 'bar-left' }, back ? h('button', { class: 'btn back', onclick: back }, '← もどる') : h('div', { class: 'logo' }, '📚 記録ベース')),
     h('div', { class: 'bar-title', text: title || '' }),
     h('div', { class: 'bar-right' },
@@ -132,7 +138,66 @@ function setSave(s) {
   e.textContent = s === 'saving' ? '保存中…' : s === 'saved' ? '保存しました ✓' : s === 'error' ? '保存できませんでした' : '';
 }
 
+// ---------- 保存（画面ごと） ----------
+
+// 保存に失敗したまま画面を離れようとしたときに聞く。true なら移ってよい
+function askSaveFailed(saver) {
+  return new Promise((resolve) => {
+    const ask = () => modal({
+      title: '保存できませんでした',
+      body: 'iPadの空き容量が少ないなどの理由で、保存できませんでした。「もう一度」を押してください。',
+      buttons: [
+        { label: 'この画面にのこる', onClick: () => resolve(false) },
+        { label: '保存せずに移る（最後の変更は消えます）', cls: 'danger', onClick: () => resolve(true) },
+        { label: 'もう一度', cls: 'primary', onClick: async () => {
+          if (await saver.flush()) { toast('保存しました'); resolve(true); } else ask();
+        } },
+      ],
+    });
+    ask();
+  });
+}
+
+// 画面の保存係をつくる。画面を離れるときは保存が終わるまで待ち、失敗したら移動を止める
+// busy：まだ終わっていない作業（写真の保存など）。画面を離れる前に終わるのを待つ
+function screenSaver(write, { afterLeave, busy } = {}) {
+  const saver = makeSaver({ write, onStatus: setSave });
+  const onHide = () => { if (document.visibilityState === 'hidden') saver.flush(); };
+  const onPageHide = () => { saver.flush(); };
+  document.addEventListener('visibilitychange', onHide);
+  window.addEventListener('pagehide', onPageHide);
+  state.leave = async () => {
+    if (busy && busy.size) {
+      toast('写真を保存しています。少し待ってください');
+      await Promise.allSettled([...busy]);
+    }
+    const ok = (await saver.flush()) || (await askSaveFailed(saver));
+    if (!ok) return false;
+    document.removeEventListener('visibilitychange', onHide);
+    window.removeEventListener('pagehide', onPageHide);
+    saver.dispose();
+    if (afterLeave) { try { await afterLeave(); } catch (e) { console.warn(e); } }
+    return true;
+  };
+  return saver;
+}
+
 // ---------- 写真のURL ----------
+
+// 表示用のURLを手放す（画面を移るたびに。開いた画面で必要な分だけ作り直す）
+function releaseURLs() {
+  for (const m of [state.photoURL, state.thumbURL]) {
+    for (const u of m.values()) URL.revokeObjectURL(u);
+    m.clear();
+  }
+}
+
+// そのページで使っていない写真を消す（外した・入れかえた写真）。入力画面を離れて保存できた後にだけ呼ぶ
+async function cleanupPhotos(sheet) {
+  const used = new Set();
+  for (const v of Object.values(sheet.values || {})) for (const id of (v && v.photoIds) || []) used.add(id);
+  for (const p of await db.photosOf(sheet.id)) if (!used.has(p.id)) await db.remove('photos', p.id);
+}
 
 async function loadPhotos(sheetId) {
   for (const p of await db.photosOf(sheetId)) {
@@ -211,7 +276,7 @@ async function home() {
       est ? h('span', { text: `使用量：${(est.usage / 1048576).toFixed(1)}MB` }) : null));
   }
   parts.push(foot);
-  $view.replaceChildren(...parts);
+  fill($view, ...parts);
 }
 
 // ---------- 画面：新しい単元 ----------
@@ -223,7 +288,7 @@ async function newUnit() {
   const items = h('div', { class: 'kind-grid' });
   const next = h('button', { class: 'btn primary huge', onclick: create }, 'つぎへ（ならべ方を見る） →');
   const drawItems = () => {
-    items.replaceChildren(...KINDS.map((k) => h('button', {
+    fill(items, ...KINDS.map((k) => h('button', {
       class: `kind${chosen.has(k.kind) ? ' on' : ''}${k.teacher ? ' teacher' : ''}`,
       'aria-pressed': chosen.has(k.kind) ? 'true' : 'false',
       onclick: () => { chosen.has(k.kind) ? chosen.delete(k.kind) : chosen.add(k.kind); drawItems(); },
@@ -236,16 +301,35 @@ async function newUnit() {
     if (!chosen.size) { toast('項目を1つ以上えらんでください'); return; }
     const layout = autoLayout(KINDS.map((k) => k.kind).filter((k) => chosen.has(k)));
     if (!layout) { toast('項目が多すぎて、A4一枚に入りません。いくつか外してください'); return; }
+    await saveNew(title, layout, []);
+  }
+  async function saveNew(title, layout, goalChoices) {
     const now = new Date().toISOString();
-    const book = { id: db.newId(), title, createdAt: now, updatedAt: now, template: layout };
-    await db.put('books', book);
+    const book = { id: db.newId(), title, createdAt: now, updatedAt: now, template: layout, goalChoices };
+    try {
+      await db.put('books', book);
+    } catch (e) {
+      toast('単元を保存できませんでした。もう一度ためしてください');
+      return;
+    }
     go(`#/layout/book/${book.id}/start`);
   }
-  $view.replaceChildren(
+  // ほかの単元の様式（項目・配置・目標の書き方・数える項目・目標の候補）をコピーして始める
+  const others = (await db.liveBooks()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const copyPanel = others.length ? h('section', { class: 'panel' },
+    h('h2', { text: '③ または、前に作った単元の様式をコピーする' }),
+    h('p', { class: 'hint', text: '項目・配置・目標の書き方・数える項目・目標の候補が、そのままコピーされます。記録の中身はコピーされません。' }),
+    h('div', { class: 'row' }, ...others.map((o) => h('button', { class: 'btn', onclick: () => {
+      const title = name.value.trim();
+      if (!title) { toast('先に、単元の名前を書いてください'); name.focus(); return; }
+      saveNew(title, cloneLayout(o.template), [...(o.goalChoices || [])]);
+    } }, `📘 ${o.title}`)))) : null;
+  fill($view, 
     h('section', { class: 'panel' }, h('h2', { text: '① 単元の名前' }), name),
     h('section', { class: 'panel' }, h('h2', { text: '② シートにのせる項目をえらぶ' }),
       h('p', { class: 'hint', text: 'おすすめの項目に、はじめからチェックが付いています。押すと付けたり外したりできます。' }), items),
-    h('div', { class: 'center' }, next));
+    h('div', { class: 'center' }, next),
+    copyPanel);
   setTimeout(() => name.focus(), 50);
 }
 
@@ -284,7 +368,7 @@ async function bookView(bookId) {
       goalLine(s) ? h('div', { class: 'card-goal', text: `🎯 ${goalLine(s)}` }) : null,
       countsLine(s) ? h('div', { class: 'card-goal', text: `🔢 ${countsLine(s)}` }) : null));
   }
-  $view.replaceChildren(actions, tools || '',
+  fill($view, actions, tools || '',
     h('h2', { class: 'page-h', text: `ページ（${sheets.length}まい）` }),
     sheets.length ? list : h('p', { class: 'hint', text: 'まだページがありません。「つぎの記録をつくる」から始めましょう。' }));
 }
@@ -304,8 +388,11 @@ function editGoalChoices(book) {
   book.goalChoices = book.goalChoices || [];
   const list = h('div');
   const input = h('input', { class: 'big-input', placeholder: '例：なわとびを10回とぶ', maxlength: '60' });
-  const persist = async () => { book.updatedAt = new Date().toISOString(); await db.put('books', book); };
-  const draw = () => list.replaceChildren(...(book.goalChoices.length ? book.goalChoices.map((c, i) => h('div', { class: 'cand-edit' },
+  const persist = async () => {
+    book.updatedAt = new Date().toISOString();
+    try { await db.put('books', book); } catch (e) { toast('候補を保存できませんでした。もう一度ためしてください'); }
+  };
+  const draw = () => fill(list, ...(book.goalChoices.length ? book.goalChoices.map((c, i) => h('div', { class: 'cand-edit' },
     h('span', { text: c }),
     h('button', { class: 'btn small', disabled: i === 0, 'aria-label': '上へ', onclick: () => { const a = book.goalChoices; [a[i - 1], a[i]] = [a[i], a[i - 1]]; persist(); draw(); } }, '↑'),
     h('button', { class: 'btn small danger', onclick: () => { book.goalChoices.splice(i, 1); persist(); draw(); } }, '✕ けす'))) : [h('p', { class: 'hint', text: 'まだ候補がありません。' })]));
@@ -328,7 +415,22 @@ function editGoalChoices(book) {
   });
 }
 
-async function nextSheet(book) {
+// opts.skipLayoutAsk：様式の画面から来たときは、もう聞かない
+async function nextSheet(book, { skipLayoutAsk = false } = {}) {
+  // 先生モードのときだけ聞く（児童生徒はいつもの手順のまま、すぐ作れる）
+  if (state.teacher && !skipLayoutAsk) {
+    modal({
+      title: 'どの様式で記録をつくりますか？',
+      body: h('div', {},
+        h('p', { text: '様式を変えると、このページから先に使われます。前に作ったページは変わりません。' })),
+      buttons: [
+        { label: 'やめる' },
+        { label: '🧩 様式を変えてからつくる', onClick: () => go(`#/layout/book/${book.id}/next`) },
+        { label: '今の様式でつくる', cls: 'primary', onClick: () => nextSheet(book, { skipLayoutAsk: true }) },
+      ],
+    });
+    return;
+  }
   const sheets = await db.sheetsOf(book.id);
   const prev = sheets[sheets.length - 1];
   const opts = carryOptions(book.template, prev && prev.values);
@@ -343,8 +445,13 @@ async function nextSheet(book) {
       id: db.newId(), bookId: book.id, no: all.reduce((m, s) => Math.max(m, s.no), 0) + 1,
       createdAt: now, updatedAt: now, layout: cloneLayout(book.template), values,
     };
-    await db.put('sheets', sheet);
-    await touchBook(book.id);
+    try {
+      await db.put('sheets', sheet);
+      await touchBook(book.id);
+    } catch (e) {
+      toast('ページを作れませんでした（保存できませんでした）。もう一度ためしてください');
+      return;
+    }
     go(`#/sheet/${sheet.id}`);
   };
   if (!opts.length) return make(null);
@@ -365,54 +472,31 @@ async function sheetView(sheetId) {
   await loadPhotos(sheetId);
   const prevSheet = (await db.sheetsOf(sheet.bookId)).filter((s) => s.no < sheet.no).pop() || null;
 
-  const undo = [];
-  let dirty = false;
-  let timer = null;
-
-  async function flush() {
-    clearTimeout(timer);
-    if (!dirty) return;
-    dirty = false;
-    setSave('saving');
-    try {
-      sheet.updatedAt = new Date().toISOString();
-      await db.put('sheets', sheet);
-      await touchBook(sheet.bookId);
-      setSave('saved');
-    } catch (e) {
-      dirty = true;
-      setSave('error');
-      toast('保存できませんでした。もう一度ためします');
-      timer = setTimeout(flush, 2000);
-    }
-  }
-  function changed(now = false) {
-    dirty = true;
-    setSave('saving');
-    clearTimeout(timer);
-    if (now) return flush();
-    timer = setTimeout(flush, 500);
-  }
+  const undo = []; // 変更する「前」の中身を積む
+  const busy = new Set(); // 保存中の写真
+  const saver = screenSaver(async () => {
+    sheet.updatedAt = new Date().toISOString();
+    await db.put('sheets', sheet);
+    await touchBook(sheet.bookId);
+  }, { afterLeave: () => cleanupPhotos(sheet), busy });
+  // 書いたらすぐ保存（0.15秒だけまとめる）。now なら待たずに保存し、結果（true/false）を返す
+  const changed = (now = false) => saver.changed(now);
+  // 変更の直前に呼ぶ。同じ中身は積まない
   function pushUndo() {
-    undo.push(JSON.stringify(sheet.values));
+    const snap = JSON.stringify(sheet.values);
+    if (undo[undo.length - 1] === snap) return;
+    undo.push(snap);
     if (undo.length > 20) undo.shift();
     undoBtn.disabled = false;
   }
-  state.leave = flush;
-  const onHide = () => { if (document.visibilityState === 'hidden') flush(); };
-  document.addEventListener('visibilitychange', onHide);
-  window.addEventListener('pagehide', flush);
-  const prevLeave = state.leave;
-  state.leave = async () => {
-    document.removeEventListener('visibilitychange', onHide);
-    window.removeEventListener('pagehide', flush);
-    await prevLeave();
-  };
 
   const undoBtn = h('button', { class: 'btn', disabled: true, onclick: () => {
-    if (!undo.length) return;
-    sheet.values = JSON.parse(undo.pop());
+    const now = JSON.stringify(sheet.values);
+    let snap = undo.pop();
+    while (snap === now && undo.length) snap = undo.pop();
     undoBtn.disabled = !undo.length;
+    if (!snap || snap === now) return;
+    sheet.values = JSON.parse(snap);
     changed(true);
     draw();
     toast('ひとつ前にもどしました');
@@ -424,8 +508,7 @@ async function sheetView(sheetId) {
     actions.push(h('button', { class: 'btn danger', onclick: async () => {
       if (!(await confirmBox('このページをごみ箱へ', `${sheet.no}まいめをごみ箱に入れます。ごみ箱から元にもどせます。`, 'ごみ箱へ'))) return;
       sheet.deletedAt = new Date().toISOString();
-      dirty = true;
-      await flush();
+      if (!(await changed(true))) { delete sheet.deletedAt; toast('保存できなかったので、ごみ箱に入れていません'); return; }
       go(`#/book/${sheet.bookId}`);
     } }, '🗑'));
   }
@@ -434,12 +517,12 @@ async function sheetView(sheetId) {
 
   const notice = h('div', { class: 'banner warn hidden' });
   const holder = h('div', { class: 'sheet-holder' });
-  $view.replaceChildren(h('p', { class: 'hint center', text: '書きたい欄を押してください。書いたものは自動で保存されます。' }), notice, holder);
+  fill($view, h('p', { class: 'hint center', text: '書きたい欄を押してください。書いたものは自動で保存されます。' }), notice, holder);
 
   function draw() {
     const s = buildSheet({ unitTitle: book.title, no: sheet.no, layout: sheet.layout, values: sheet.values, photoURL: (id) => state.photoURL.get(id), mode: 'input' });
     const w = Math.min(holder.clientWidth || $view.clientWidth, 900);
-    holder.replaceChildren(fitBox(s, w));
+    fill(holder, fitBox(s, w));
     s.addEventListener('click', (e) => {
       const blk = e.target.closest('.blk');
       if (blk) openEditor(blk.dataset.id);
@@ -458,11 +541,11 @@ async function sheetView(sheetId) {
       return;
     }
     const v = sheet.values[id] || (sheet.values[id] = {});
-    pushUndo();
+    // 書き始め（1.5秒あいてから打った最初の1文字）の前の中身を、もどす先にする
     let typingTimer = null;
     const onType = (text) => {
-      if (!typingTimer) { /* 書き始め */ } else clearTimeout(typingTimer);
-      typingTimer = setTimeout(() => { typingTimer = null; pushUndo(); }, 1500);
+      if (typingTimer) clearTimeout(typingTimer); else pushUndo();
+      typingTimer = setTimeout(() => { typingTimer = null; }, 1500);
       v.text = text;
       changed();
     };
@@ -497,7 +580,7 @@ async function sheetView(sheetId) {
         const cands = book.goalChoices || [];
         if (cands.length) {
           const row = h('div', { class: 'cand-row' });
-          const drawC = () => row.replaceChildren(...cands.map((c) => h('button', { class: `cand${(v.text || '') === c ? ' on' : ''}`, onclick: () => {
+          const drawC = () => fill(row, ...cands.map((c) => h('button', { class: `cand${(v.text || '') === c ? ' on' : ''}`, onclick: () => {
             pushUndo();
             v.text = c;
             ta.value = c;
@@ -524,15 +607,15 @@ async function sheetView(sheetId) {
         body.append(numRow(r.label, r.unit, v.nums, r.id, hasNum(prevNums[r.id]) ? `前回 ${prevNums[r.id]}${r.unit || ''}` : null));
       }
     } else if (info.type === 'date') {
-      const d = h('input', { type: 'date', class: 'big-input', value: v.text || todayISO(), oninput: (e) => { v.text = e.target.value; changed(); } });
+      const d = h('input', { type: 'date', class: 'big-input', value: v.text || todayISO(), oninput: (e) => { pushUndo(); v.text = e.target.value; changed(); } });
       if (!v.text) { v.text = d.value; changed(); }
-      body.append(d, h('button', { class: 'btn', onclick: () => { d.value = todayISO(); v.text = d.value; changed(); } }, '今日にする'));
+      body.append(d, h('button', { class: 'btn', onclick: () => { pushUndo(); d.value = todayISO(); v.text = d.value; changed(); } }, '今日にする'));
     } else if (info.type === 'photo') {
       const max = b.photoCount || 1;
       const shown = h('div', { class: 'photo-list' });
       const drawPhotos = () => {
         const ids = v.photoIds || [];
-        shown.replaceChildren(...(ids.length ? ids.slice(0, max).map((pid, i) => h('div', { class: 'photo-item' },
+        fill(shown, ...(ids.length ? ids.slice(0, max).map((pid, i) => h('div', { class: 'photo-item' },
           h('img', { src: state.photoURL.get(pid) || '', alt: '写真' }),
           h('button', { class: 'btn small', onclick: () => {
             pushUndo();
@@ -541,13 +624,31 @@ async function sheetView(sheetId) {
             drawPhotos();
           } }, '✕ はずす'))) : [h('p', { class: 'hint', text: 'まだ写真がありません' })]));
       };
-      const pick = (capture) => {
+      // slot：入れかえる写真の番号（null なら後ろに足す）
+      const pick = (capture, slot = null) => {
+        const ids0 = (v.photoIds || []).slice(0, max);
+        if (slot === null && ids0.length >= max) {
+          if (max === 1) return pick(capture, 0);
+          // いっぱいのときは、どれと入れかえるか選んでもらう
+          const close = modal({
+            title: 'どの写真と入れかえますか？',
+            body: h('div', { class: 'photo-list' }, ...ids0.map((pid, i) => h('button', { class: 'photo-pick', onclick: () => { close(); pick(capture, i); } },
+              h('img', { src: state.photoURL.get(pid) || '', alt: `${i + 1}まいめの写真` }), h('span', { text: `${i + 1}まいめと入れかえる` })))),
+            buttons: [{ label: 'やめる' }],
+          });
+          return;
+        }
         const inp = h('input', { type: 'file', accept: 'image/*', class: 'hidden' });
         if (capture) inp.setAttribute('capture', 'environment');
-        inp.addEventListener('change', async () => {
+        inp.addEventListener('change', () => {
           const f = inp.files && inp.files[0];
           inp.remove();
           if (!f) return;
+          const job = addPhoto(f);
+          busy.add(job);
+          job.finally(() => busy.delete(job));
+        });
+        const addPhoto = async (f) => {
           setSave('saving');
           try {
             const p = await shrinkPhoto(f);
@@ -557,15 +658,15 @@ async function sheetView(sheetId) {
             state.thumbURL.set(rec.id, URL.createObjectURL(rec.thumb));
             pushUndo();
             const ids = (v.photoIds || []).slice(0, max);
-            if (ids.length >= max) ids[max - 1] = rec.id; else ids.push(rec.id);
+            if (slot !== null && slot < ids.length) ids[slot] = rec.id; else ids.push(rec.id);
             v.photoIds = ids;
-            await changed(true);
+            if (!(await changed(true))) toast('保存できませんでした。もう一度ためしています');
             drawPhotos();
           } catch (e) {
             setSave('error');
             toast(e.message || '写真を保存できませんでした');
           }
-        });
+        };
         document.body.append(inp);
         inp.click();
       };
@@ -573,11 +674,11 @@ async function sheetView(sheetId) {
       body.append(shown, h('div', { class: 'row' },
         h('button', { class: 'btn primary huge', onclick: () => pick(true) }, '📷 カメラでとる'),
         h('button', { class: 'btn huge', onclick: () => pick(false) }, '🖼 写真をえらぶ')),
-      max > 1 ? h('p', { class: 'hint', text: `写真は${max}まいまで。いっぱいのときは、最後の写真と入れかわります。` }) : null);
+      h('p', { class: 'hint', text: max > 1 ? `写真は${max}まいまで。いっぱいのときは、どの写真と入れかえるか選べます。` : 'もう一度とると、写真が入れかわります。「もどす」で前の写真にもどせます。' }));
     } else {
       if (info.type === 'choice') {
         const chips = h('div', { class: 'choice-row' });
-        const drawChips = () => chips.replaceChildren(...FEELING_CHOICES.map((c) => {
+        const drawChips = () => fill(chips, ...FEELING_CHOICES.map((c) => {
           const on = (v.choices || []).includes(c);
           return h('button', { class: `choice${on ? ' on' : ''}`, 'aria-pressed': on ? 'true' : 'false', onclick: () => {
             pushUndo();
@@ -597,7 +698,7 @@ async function sheetView(sheetId) {
 
     modal({
       title: `${info.icon} ${b.label}`, body, wide: true,
-      buttons: [{ label: 'とじる ✓', cls: 'primary', onClick: () => { changed(true); draw(); } }],
+      buttons: [{ label: 'とじる ✓', cls: 'primary', onClick: () => { saver.flush(); draw(); } }],
     });
   }
 
@@ -606,7 +707,9 @@ async function sheetView(sheetId) {
 
 // ---------- 画面：様式調整 ----------
 
-async function layoutView(target, id, start) {
+// mode：'start'（新しい単元を作った直後）／'next'（つぎの記録をつくる前に様式を変える）
+async function layoutView(target, id, mode) {
+  const start = mode === 'start';
   let book;
   let sheet = null;
   if (target === 'sheet') {
@@ -626,26 +729,29 @@ async function layoutView(target, id, start) {
   const layout = sheet ? sheet.layout : book.template;
   let selected = layout.blocks[0] ? layout.blocks[0].id : null;
 
-  const save = async () => {
+  const saver = screenSaver(async () => {
     if (sheet) { sheet.updatedAt = new Date().toISOString(); await db.put('sheets', sheet); }
     else { book.updatedAt = new Date().toISOString(); await db.put('books', book); }
-  };
+  });
+  const save = () => saver.changed();
   const startBtn = h('button', { class: 'btn primary', onclick: async () => {
-    await save();
-    if (start) return nextSheet(book);
+    if (!(await saver.flush())) { toast('保存できませんでした。もう一度押してください'); return; }
+    if (start || mode === 'next') return nextSheet(book, { skipLayoutAsk: true });
     go(sheet ? `#/sheet/${sheet.id}` : `#/book/${book.id}`);
-  } }, start ? 'この様式で始める →' : 'できた ✓');
+  } }, start ? 'この様式で始める →' : mode === 'next' ? 'この様式で記録をつくる →' : 'できた ✓');
   setBar({
     back: () => go(sheet ? `#/sheet/${sheet.id}` : `#/book/${book.id}`),
     title: sheet ? `${sheet.no}まいめの配置` : `「${book.title}」の様式`,
     actions: [startBtn],
+    save: true,
   });
+  setSave('saved');
 
   const holder = h('div', { class: 'sheet-holder layout' });
   const tools = h('div', { class: 'layout-tools' });
   const note = sheet ? 'このページだけの配置です。ほかのページは変わりません。'
     : 'ここで決めた様式は、これから作るページに使われます。前に作ったページは変わりません。';
-  $view.replaceChildren(
+  fill($view, 
     h('p', { class: 'hint center', text: `${note} 欄を長押しすると動かせます。右下の丸で大きさを変えます。` }),
     h('div', { class: 'layout-wrap' }, holder, tools));
 
@@ -673,10 +779,10 @@ async function layoutView(target, id, start) {
         draw();
       } }, h('span', { class: 'kind-icon', text: k.icon }), h('span', { text: k.label })))), buttons: [{ label: 'やめる' }] });
     } }, '＋ 欄を足す');
-    if (!b) { tools.replaceChildren(addBtn); return; }
+    if (!b) { fill(tools, addBtn); return; }
     const mv = (dx, dy) => tryChange(b, { x: b.x + dx, y: b.y + dy });
     const rs = (dw, dh) => tryChange(b, { w: b.w + dw, h: b.h + dh });
-    tools.replaceChildren(
+    fill(tools, 
       h('div', { class: 'tool-title', text: `えらんでいる欄：${b.label}` }),
       h('div', { class: 'tool-group' }, h('span', { text: '動かす' }),
         h('div', { class: 'pad' },
@@ -758,7 +864,7 @@ async function layoutView(target, id, start) {
     const s = buildSheet({ unitTitle: book.title, no: sheet && sheet.no, layout, values: sheet ? sheet.values : {}, photoURL: (pid) => state.photoURL.get(pid), mode: 'layout', showValues: !!sheet, selectedId: selected });
     const avail = holder.clientWidth || 600;
     const maxH = window.innerHeight - 150;
-    holder.replaceChildren(fitBox(s, avail, maxH));
+    fill(holder, fitBox(s, avail, maxH));
     if (sheet) markOverflow(s);
     wireDrag(s);
     drawTools();
@@ -849,7 +955,7 @@ async function reviewView(bookId, sheetId) {
     strip.append(h('button', { class: `strip-item${j === i ? ' on' : ''}`, onclick: () => goto(j) },
       t ? h('img', { src: t, alt: '' }) : h('span', { text: '📄' }), h('span', { text: `${s.no}` })));
   }
-  $view.replaceChildren(
+  fill($view, 
     h('div', { class: 'review' }, prev, stage, next),
     h('div', { class: 'review-foot' },
       h('div', { class: 'page-count', text: `${i + 1} / ${sheets.length}` }),
@@ -885,7 +991,7 @@ async function printView(sheetId) {
   setBar({ back: () => (history.length > 1 ? history.back() : go(`#/sheet/${sheetId}`)), title: `${sheet.no}まいめを印刷` });
   const holder = h('div', { class: 'sheet-holder' });
   const warn = h('div', { class: 'banner warn hidden' });
-  $view.replaceChildren(
+  fill($view, 
     h('div', { class: 'center' },
       h('button', { class: 'btn primary huge', onclick: doPrint }, '🖨 印刷する・PDFにする'),
       h('p', { class: 'hint', text: 'iPadの印刷画面が開きます。プリンターをえらぶと印刷できます。PDFにするときは、印刷画面の共有ボタン（□↑）→「\"ファイル\"に保存」をえらびます。' })),
@@ -895,12 +1001,18 @@ async function printView(sheetId) {
   const over = markOverflow(s);
   if (over) {
     warn.classList.remove('hidden');
-    warn.textContent = `文が入りきっていない欄が${over}つあります。このまま印刷すると、はみ出した文は切れます。`;
+    fill(warn,
+      h('div', { text: `文が入りきっていない欄が${over}つあります。このまま印刷すると、はみ出した文は切れます。` }),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn', onclick: () => go(`#/sheet/${sheetId}`) }, '✏️ 入力にもどる'),
+        state.teacher
+          ? h('button', { class: 'btn', onclick: () => go(`#/layout/sheet/${sheetId}`) }, '🧩 配置を直す')
+          : h('span', { class: 'hint', text: '配置を直すときは、先生モードで「🧩 配置」を使います。' })));
   }
 
   async function doPrint() {
     const real = make();
-    $print.replaceChildren(real);
+    fill($print, real);
     await Promise.all([...real.querySelectorAll('img')].map((img) => (img.decode ? img.decode().catch(() => {}) : null)));
     window.print();
   }
@@ -921,7 +1033,7 @@ async function trashView() {
     ...dBooks.map((b) => h('div', { class: 'trash-row' }, h('span', { text: `📘 単元「${b.title}」` }), h('button', { class: 'btn primary', onclick: () => restore('books', b) }, 'もとにもどす'))),
     ...dSheets.map((s) => h('div', { class: 'trash-row' }, h('span', { text: `📄 「${titleOf(s.bookId)}」${s.no}まいめ ${sheetTitle(s)}` }), h('button', { class: 'btn primary', onclick: () => restore('sheets', s) }, 'もとにもどす'))),
   ];
-  $view.replaceChildren(
+  fill($view, 
     h('p', { class: 'hint', text: 'ごみ箱に入れた単元やページは、ここから元にもどせます。' }),
     rows.length ? h('div', { class: 'panel' }, ...rows) : h('p', { class: 'hint', text: 'ごみ箱は空です。' }),
     rows.length ? h('button', { class: 'btn danger', onclick: async () => {
@@ -936,10 +1048,20 @@ async function trashView() {
 // ---------- 道案内 ----------
 
 let routing = Promise.resolve();
+let currentHash = location.hash;
 function route() {
   routing = routing.then(async () => {
-    if (state.leave) { const f = state.leave; state.leave = null; await f(); }
-    $modal.replaceChildren();
+    if (state.leave) {
+      if ((await state.leave()) === false) {
+        // 保存できなかったので、元の画面にとどまる（アドレスだけ元にもどす）
+        if (location.hash !== currentHash) history.replaceState(null, '', currentHash || '#/');
+        return;
+      }
+      state.leave = null;
+    }
+    currentHash = location.hash;
+    releaseURLs();
+    fill($modal);
     window.scrollTo(0, 0);
     const p = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
     try {
@@ -947,21 +1069,23 @@ function route() {
       else if (p[0] === 'new') await newUnit();
       else if (p[0] === 'book') await bookView(p[1]);
       else if (p[0] === 'sheet') await sheetView(p[1]);
-      else if (p[0] === 'layout') await layoutView(p[1], p[2], p[3] === 'start');
+      else if (p[0] === 'layout') await layoutView(p[1], p[2], p[3]);
       else if (p[0] === 'review') await reviewView(p[1], p[2]);
       else if (p[0] === 'print') await printView(p[1]);
       else if (p[0] === 'trash') await trashView();
       else go('#/');
     } catch (e) {
       console.error(e);
-      $view.replaceChildren(h('div', { class: 'banner warn' }, '画面を開けませんでした。ホームにもどってください。', h('button', { class: 'btn', onclick: () => go('#/') }, 'ホームへ')));
+      fill($view, h('div', { class: 'banner warn' }, '画面を開けませんでした。ホームにもどってください。', h('button', { class: 'btn', onclick: () => go('#/') }, 'ホームへ')));
     }
   });
   return routing;
 }
 
 window.addEventListener('hashchange', route);
-window.addEventListener('afterprint', () => $print.replaceChildren());
+// 思わぬ保存の失敗などを見のがさない
+window.addEventListener('unhandledrejection', (e) => { console.error(e.reason); toast('うまく保存・表示できませんでした。もう一度ためしてください'); });
+window.addEventListener('afterprint', () => fill($print));
 let lastW = window.innerWidth;
 window.addEventListener('resize', () => {
   // iPadを縦横に回したときは描き直す（キーボードの出入りによる高さの変化では描き直さない）

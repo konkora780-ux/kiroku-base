@@ -132,6 +132,9 @@ body.teacher::after {
 .label-input { flex: 1; min-width: 0; font-size: 18px; padding: 8px 10px; border-radius: 12px; border: 2px solid var(--line); font-family: inherit; }
 .unit-input { width: 120px; font-size: 20px; padding: 8px 10px; border-radius: 12px; border: 2px solid var(--line); font-family: inherit; }
 .photo-list { display: flex; gap: 12px; flex-wrap: wrap; }
+.photo-pick { display: flex; flex-direction: column; align-items: center; gap: 6px; border: 2px solid var(--line); background: #fff; border-radius: 14px; padding: 8px; font-size: 18px; font-weight: 700; cursor: pointer; color: var(--ink); }
+.photo-pick img { width: 220px; height: 165px; object-fit: contain; background: #eee; border-radius: 10px; }
+.banner .row { margin-top: 10px; }
 .photo-item { display: flex; flex-direction: column; gap: 6px; align-items: center; }
 .photo-item img { width: 260px; height: 195px; object-fit: contain; background: #eee; border-radius: 12px; }
 .carry { background: #f4f8f5; border-radius: 12px; padding: 10px 14px; margin-bottom: 10px; }
