@@ -1,5 +1,5 @@
 // A4縦シート（210mm×297mm）を組み立てる。入力・様式調整・振り返り・印刷で同じものを使う。
-import { kindInfo, formatDate } from './kinds.js';
+import { kindInfo, formatDate, hasNum } from './kinds.js';
 
 export const SHEET_W = 210 * 96 / 25.4; // 画面上の大きさ（px）
 export const SHEET_H = 297 * 96 / 25.4;
@@ -8,6 +8,13 @@ function el(tag, cls, text) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
   if (text != null) e.textContent = text;
+  return e;
+}
+
+// 「🎯 目標 10 回」「できた 8 回」の札
+function numBadge(cls, label, n, unit) {
+  const e = el('span', `num-badge ${cls}`);
+  e.append(el('span', null, label), el('b', null, String(n)), el('span', null, unit || ''));
   return e;
 }
 
@@ -42,6 +49,25 @@ export function buildSheet(opts) {
     if (mode === 'layout' && !showValues) {
       body.append(el('div', 'ph', `${info.icon || ''} ${b.label}`));
       empty = false;
+    } else if (b.kind === 'goal') {
+      const mode = b.goalMode || 'text';
+      const line = el('div', 'goal-line');
+      if (mode !== 'number' && v.text && v.text.trim()) line.append(el('p', null, v.text));
+      const nums = el('div', 'goal-nums');
+      if (mode !== 'text' && hasNum(v.num)) nums.append(numBadge('goal', '🎯 目標', v.num, b.unit));
+      if (b.showResult && hasNum(v.result)) nums.append(numBadge('result', 'できた', v.result, b.unit));
+      if (nums.children.length) line.append(nums);
+      if (line.children.length) { body.append(line); empty = false; }
+    } else if (b.kind === 'counts') {
+      const nums = v.nums || {};
+      const list = el('div', 'count-list');
+      for (const r of b.rows || []) {
+        if (!hasNum(nums[r.id])) continue;
+        const item = el('div', 'count-item');
+        item.append(el('span', 'count-l', r.label), el('b', null, String(nums[r.id])), el('span', 'count-u', r.unit || ''));
+        list.append(item);
+      }
+      if (list.children.length) { body.append(list); empty = false; }
     } else if (info.type === 'date') {
       if (v.text) { body.append(el('p', null, formatDate(v.text))); empty = false; }
     } else if (info.type === 'photo') {

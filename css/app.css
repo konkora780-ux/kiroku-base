@@ -87,6 +87,7 @@ body.teacher::after {
 .card .cover img { width: 100%; height: 100%; object-fit: cover; }
 .card-title { font-weight: 700; line-height: 1.4; }
 .card-sub { color: var(--sub); font-size: 16px; }
+.card-goal { font-size: 16px; color: var(--green-d); line-height: 1.4; }
 .new-card { border-style: dashed; border-color: var(--green); align-items: center; justify-content: center; color: var(--green); }
 .new-card .plus { font-size: 64px; line-height: 1; }
 .book-actions { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; margin: 8px 0 4px; }
@@ -113,6 +114,23 @@ body.teacher::after {
 .choice-row { display: flex; flex-wrap: wrap; gap: 10px; }
 .choice { min-height: 60px; padding: 0 20px; border-radius: 30px; border: 2px solid var(--chip-line); background: #fff; font-size: 21px; font-weight: 700; color: var(--ink); cursor: pointer; }
 .choice.on { background: var(--chip); border-width: 3px; }
+.num-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.num-row .num-label { font-size: 20px; font-weight: 700; width: 7.5em; }
+.num-row .btn { width: 72px; font-size: 32px; padding: 0; }
+.num-input { width: 140px; text-align: center; font-size: 36px; font-weight: 700; padding: 8px; border-radius: 14px; border: 2px solid var(--line); font-family: inherit; min-height: 64px; }
+.num-row .unit { font-size: 24px; font-weight: 700; }
+.cand-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.cand { min-height: 56px; padding: 0 18px; border-radius: 14px; border: 2px solid #b5cdbd; background: #f4faf6; font-size: 20px; font-weight: 700; color: var(--ink); cursor: pointer; text-align: left; }
+.cand.on { background: #dff0e5; border-color: var(--green); }
+.cand-edit { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+.cand-edit span { flex: 1; font-size: 19px; }
+.prev { font-size: 18px; color: var(--sub); background: #f1f1ee; border-radius: 10px; padding: 4px 10px; }
+.prev b { color: var(--ink); }
+.row-edit { display: flex; gap: 6px; align-items: center; margin: 6px 0; font-size: 17px; color: var(--ink); }
+.row-edit .name { flex: 1; font-weight: 700; }
+.row-edit .btn { min-height: 44px; padding: 0 10px; font-size: 16px; }
+.label-input { flex: 1; min-width: 0; font-size: 18px; padding: 8px 10px; border-radius: 12px; border: 2px solid var(--line); font-family: inherit; }
+.unit-input { width: 120px; font-size: 20px; padding: 8px 10px; border-radius: 12px; border: 2px solid var(--line); font-family: inherit; }
 .photo-list { display: flex; gap: 12px; flex-wrap: wrap; }
 .photo-item { display: flex; flex-direction: column; gap: 6px; align-items: center; }
 .photo-item img { width: 260px; height: 195px; object-fit: contain; background: #eee; border-radius: 12px; }
@@ -194,6 +212,18 @@ body.teacher::after {
 .blk.row1 h3 { margin: 0; white-space: nowrap; }
 .blk.row1 .body { display: flex; align-items: center; height: 100%; }
 .blk.row1 .chips { margin: 0 2mm 0 0; }
+.goal-line { display: flex; flex-wrap: wrap; align-items: center; gap: 1.5mm 4mm; }
+.goal-nums { display: flex; gap: 3mm; flex-wrap: wrap; }
+.num-badge { display: inline-flex; align-items: baseline; gap: 1mm; border: .4mm solid #e2b54a; background: #fff8e6; border-radius: 2mm; padding: .2mm 2.5mm; font-size: 3.8mm; white-space: nowrap; }
+.num-badge b { font-size: 6mm; line-height: 1.2; }
+.num-badge.result { border-color: var(--green); background: #e9f5ed; }
+.count-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(38mm, 1fr)); gap: 1.5mm 3mm; }
+.count-item { display: flex; align-items: baseline; gap: 1.2mm; border-bottom: .3mm dotted var(--line); padding-bottom: .5mm; min-width: 0; }
+.count-item .count-l { flex: 1; font-size: 4.2mm; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.count-item b { font-size: 6.6mm; line-height: 1.2; }
+.count-item .count-u { font-size: 3.8mm; }
+.blk.row1 .count-list { display: flex; flex-wrap: wrap; gap: 1mm 5mm; }
+.blk.row1 .count-item { border: none; }
 .blk.teacher { border-color: var(--teacher); background: var(--teacher-bg); }
 .blk.teacher h3 { color: var(--teacher); }
 .blk.kind-photo { padding: 1.5mm; }

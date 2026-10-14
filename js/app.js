@@ -2,7 +2,8 @@
 import * as db from './db.js';
 import {
   KINDS, RECOMMENDED, FEELING_CHOICES, COLS, ROWS, kindInfo, autoLayout, canPlace, addBlock,
-  cloneLayout, carryOptions, todayISO, formatDate,
+  cloneLayout, carryOptions, todayISO, formatDate, GOAL_MODES, GOAL_UNITS, goalText,
+  newCountRow, countsText, hasNum,
 } from './kinds.js';
 import { buildSheet, markOverflow, fitBox } from './sheet.js';
 import { shrinkPhoto } from './photo.js';
@@ -261,6 +262,7 @@ async function bookView(bookId) {
     h('button', { class: 'btn huge', disabled: !sheets.length, onclick: () => go(`#/review/${bookId}/${sheets[sheets.length - 1].id}`) }, '📖 ふりかえる'));
   const tools = state.teacher ? h('div', { class: 'teacher-tools' },
     h('button', { class: 'btn', onclick: () => go(`#/layout/book/${bookId}`) }, '🧩 様式を変える'),
+    book.template.blocks.some((b) => b.kind === 'goal') ? h('button', { class: 'btn', onclick: () => editGoalChoices(book) }, '🎯 目標の候補') : null,
     h('button', { class: 'btn', onclick: async () => {
       const t = await promptBox('単元の名前を変える', book.title);
       if (t) { book.title = t; book.updatedAt = new Date().toISOString(); await db.put('books', book); route(); }
@@ -278,22 +280,63 @@ async function bookView(bookId) {
     list.append(h('button', { class: 'card page-card', onclick: () => go(`#/review/${bookId}/${s.id}`) },
       h('div', { class: 'cover' }, thumb ? h('img', { src: thumb, alt: '' }) : h('span', { text: '📄' })),
       h('div', { class: 'card-title', text: `${s.no}まいめ　${sheetTitle(s)}` }),
-      h('div', { class: 'card-sub', text: formatDate(sheetDate(s)) })));
+      h('div', { class: 'card-sub', text: formatDate(sheetDate(s)) }),
+      goalLine(s) ? h('div', { class: 'card-goal', text: `🎯 ${goalLine(s)}` }) : null,
+      countsLine(s) ? h('div', { class: 'card-goal', text: `🔢 ${countsLine(s)}` }) : null));
   }
   $view.replaceChildren(actions, tools || '',
     h('h2', { class: 'page-h', text: `ページ（${sheets.length}まい）` }),
     sheets.length ? list : h('p', { class: 'hint', text: 'まだページがありません。「つぎの記録をつくる」から始めましょう。' }));
 }
 
+function countsLine(sheet) {
+  const cb = sheet.layout.blocks.find((b) => b.kind === 'counts');
+  return cb ? countsText(cb, sheet.values[cb.id]) : '';
+}
+
+function goalLine(sheet) {
+  const gb = sheet.layout.blocks.find((b) => b.kind === 'goal');
+  return gb ? goalText(gb, sheet.values[gb.id]) : '';
+}
+
+// 先生が「目標の候補」を登録する（単元ごと）。児童生徒は入力のときに押して選べる
+function editGoalChoices(book) {
+  book.goalChoices = book.goalChoices || [];
+  const list = h('div');
+  const input = h('input', { class: 'big-input', placeholder: '例：なわとびを10回とぶ', maxlength: '60' });
+  const persist = async () => { book.updatedAt = new Date().toISOString(); await db.put('books', book); };
+  const draw = () => list.replaceChildren(...(book.goalChoices.length ? book.goalChoices.map((c, i) => h('div', { class: 'cand-edit' },
+    h('span', { text: c }),
+    h('button', { class: 'btn small', disabled: i === 0, 'aria-label': '上へ', onclick: () => { const a = book.goalChoices; [a[i - 1], a[i]] = [a[i], a[i - 1]]; persist(); draw(); } }, '↑'),
+    h('button', { class: 'btn small danger', onclick: () => { book.goalChoices.splice(i, 1); persist(); draw(); } }, '✕ けす'))) : [h('p', { class: 'hint', text: 'まだ候補がありません。' })]));
+  const add = () => {
+    const t = input.value.trim();
+    if (!t) return;
+    if (!book.goalChoices.includes(t)) book.goalChoices.push(t);
+    input.value = '';
+    persist();
+    draw();
+    input.focus();
+  };
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+  draw();
+  modal({
+    title: '🎯 目標の候補', wide: true,
+    body: h('div', {}, h('p', { class: 'hint', text: 'ここに登録した目標は、記録を書くときに押して選べます（この単元だけ）。' }),
+      list, h('div', { class: 'row' }, input, h('button', { class: 'btn primary', onclick: add }, '＋ 足す'))),
+    buttons: [{ label: 'できた ✓', cls: 'primary', onClick: () => route() }],
+  });
+}
+
 async function nextSheet(book) {
   const sheets = await db.sheetsOf(book.id);
   const prev = sheets[sheets.length - 1];
   const opts = carryOptions(book.template, prev && prev.values);
-  const make = async (carryText) => {
+  const make = async (carry) => {
     const values = {};
     for (const b of book.template.blocks) if (b.kind === 'date') values[b.id] = { text: todayISO() };
     const goal = book.template.blocks.find((b) => b.kind === 'goal');
-    if (carryText && goal) values[goal.id] = { text: carryText };
+    if (carry && goal) values[goal.id] = { ...carry };
     const now = new Date().toISOString();
     const all = await db.sheetsOf(book.id, { withDeleted: true });
     const sheet = {
@@ -308,7 +351,7 @@ async function nextSheet(book) {
   modal({
     title: '前回の目標を使いますか？',
     body: h('div', {}, ...opts.map((o) => h('div', { class: 'carry' }, h('div', { class: 'carry-l', text: o.label }), h('div', { class: 'carry-t', text: o.text })))),
-    buttons: [...opts.map((o) => ({ label: o.id === 'goal' ? '前回の目標を使う' : '「次回に向けて」を使う', cls: 'primary', onClick: () => make(o.text) })),
+    buttons: [...opts.map((o) => ({ label: o.id === 'goal' ? '前回の目標を使う' : '「次回に向けて」を使う', cls: 'primary', onClick: () => make(o.value) })),
       { label: '使わない', onClick: () => make(null) }],
   });
 }
@@ -320,6 +363,7 @@ async function sheetView(sheetId) {
   if (!sheet || sheet.deletedAt) return go('#/');
   const book = await db.get('books', sheet.bookId);
   await loadPhotos(sheetId);
+  const prevSheet = (await db.sheetsOf(sheet.bookId)).filter((s) => s.no < sheet.no).pop() || null;
 
   const undo = [];
   let dirty = false;
@@ -424,7 +468,62 @@ async function sheetView(sheetId) {
     };
     const body = h('div', { class: 'editor' });
 
-    if (info.type === 'date') {
+    // 数を入れる1行（「−」「＋」ボタンつき）。prev は前回の数の表示
+    const numRow = (label, unit, obj, key, prev) => {
+      const inp = h('input', { class: 'num-input', type: 'number', inputmode: 'numeric', min: '0', 'aria-label': label });
+      inp.value = obj[key] ?? '';
+      const set = (n) => {
+        pushUndo();
+        obj[key] = n === '' ? '' : Math.max(0, Number(n));
+        inp.value = obj[key];
+        changed();
+      };
+      inp.addEventListener('change', () => set(inp.value));
+      const step = (d) => set(String(Math.max(0, (Number(inp.value) || 0) + d)));
+      return h('div', { class: 'num-row' },
+        h('span', { class: 'num-label', text: label }),
+        h('button', { class: 'btn', 'aria-label': '1へらす', onclick: () => step(-1) }, '−'),
+        inp,
+        h('button', { class: 'btn', 'aria-label': '1ふやす', onclick: () => step(1) }, '＋'),
+        h('span', { class: 'unit', text: unit || '' }),
+        prev ? h('span', { class: 'prev', text: prev }) : null);
+    };
+
+    if (b.kind === 'goal') {
+      const mode = b.goalMode || 'text';
+      if (mode !== 'number') {
+        const ta = h('textarea', { class: 'big-text', rows: '3', placeholder: 'ここに書く', oninput: (e) => onType(e.target.value) });
+        ta.value = v.text || '';
+        const cands = book.goalChoices || [];
+        if (cands.length) {
+          const row = h('div', { class: 'cand-row' });
+          const drawC = () => row.replaceChildren(...cands.map((c) => h('button', { class: `cand${(v.text || '') === c ? ' on' : ''}`, onclick: () => {
+            pushUndo();
+            v.text = c;
+            ta.value = c;
+            changed();
+            drawC();
+          } }, c)));
+          drawC();
+          body.append(h('p', { class: 'hint', text: '先生が用意した目標から、押してえらべます。自分で書いてもいいです。' }), row);
+        }
+        body.append(ta);
+      }
+      if (mode !== 'text') body.append(numRow('🎯 目標', b.unit, v, 'num'));
+      if (b.showResult) body.append(numRow('できた', b.unit, v, 'result'));
+    } else if (b.kind === 'counts') {
+      const rows = b.rows || [];
+      v.nums = v.nums || {};
+      const prevNums = (prevSheet && prevSheet.values[b.id] && prevSheet.values[b.id].nums) || {};
+      if (!rows.length) {
+        body.append(h('p', { class: 'hint', text: 'まだ数える項目がありません。先生が「🧩 配置」（このページ）か、単元の「🧩 様式を変える」で項目を足します。' }));
+      } else {
+        body.append(h('p', { class: 'hint', text: '数を入れてください。「−」「＋」でも変えられます。' }));
+      }
+      for (const r of rows) {
+        body.append(numRow(r.label, r.unit, v.nums, r.id, hasNum(prevNums[r.id]) ? `前回 ${prevNums[r.id]}${r.unit || ''}` : null));
+      }
+    } else if (info.type === 'date') {
       const d = h('input', { type: 'date', class: 'big-input', value: v.text || todayISO(), oninput: (e) => { v.text = e.target.value; changed(); } });
       if (!v.text) { v.text = d.value; changed(); }
       body.append(d, h('button', { class: 'btn', onclick: () => { d.value = todayISO(); v.text = d.value; changed(); } }, '今日にする'));
@@ -597,6 +696,8 @@ async function layoutView(target, id, start) {
           ...[1, 2].map((n) => h('button', { class: `btn${(b.photoCount || 1) === n ? ' on' : ''}`, onclick: () => { b.photoCount = n; save(); draw(); } }, `${n}まい`))))
         : h('div', { class: 'tool-group' }, h('span', { text: '文字の大きさ' }), h('div', { class: 'row' },
           ...[['s', '小'], ['m', '中'], ['l', '大']].map(([k, l]) => h('button', { class: `btn${(b.size || 'm') === k ? ' on' : ''}`, onclick: () => { b.size = k; save(); draw(); } }, l)))),
+      b.kind === 'goal' ? goalTools(b) : null,
+      b.kind === 'counts' ? countsTools(b) : null,
       h('div', { class: 'row' },
         h('button', { class: 'btn danger', onclick: () => {
           layout.blocks = layout.blocks.filter((x) => x.id !== b.id);
@@ -606,6 +707,51 @@ async function layoutView(target, id, start) {
           toast(sheet ? '欄を外しました（書いた内容は消えていません。欄を足すと出てきます）' : '欄を外しました');
         } }, 'この欄を外す'),
         addBtn));
+  }
+
+  // 「数の記録」で数える項目（例：葉の数・赤い実の数）
+  function countsTools(b) {
+    const rows = b.rows || (b.rows = []);
+    const label = h('input', { class: 'label-input', placeholder: '例：赤い実の数', maxlength: '20', 'aria-label': '数える項目の名前' });
+    const unit = h('input', { class: 'unit-input', value: 'こ', maxlength: '8', 'aria-label': '単位' });
+    const add = () => {
+      const t = label.value.trim();
+      if (!t) { toast('数える項目の名前を書いてください'); label.focus(); return; }
+      rows.push(newCountRow(t, unit.value.trim()));
+      save();
+      draw();
+      toast(`「${t}」を足しました`);
+    };
+    label.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+    return h('div', { class: 'tool-group' },
+      h('span', { text: '数える項目' }),
+      ...(rows.length ? rows.map((r, i) => h('div', { class: 'row-edit' },
+        h('span', { class: 'name', text: `${r.label}（${r.unit || '単位なし'}）` }),
+        h('button', { class: 'btn', disabled: i === 0, 'aria-label': '上へ', onclick: () => { [rows[i - 1], rows[i]] = [rows[i], rows[i - 1]]; save(); draw(); } }, '↑'),
+        h('button', { class: 'btn danger', 'aria-label': 'けす', onclick: () => { rows.splice(i, 1); save(); draw(); } }, '✕'))) : [h('div', { class: 'hint', text: 'まだありません。下で足してください。' })]),
+      h('div', { class: 'row-edit' }, label, unit),
+      h('div', { class: 'row' }, ...GOAL_UNITS.map((u) => h('button', { class: 'btn small', onclick: () => { unit.value = u; } }, u))),
+      h('button', { class: 'btn primary', onclick: add }, '＋ 項目を足す'),
+      h('div', { class: 'hint', text: sheet ? 'このページだけに使われます。' : 'これから作るページに使われます。前のページは変わりません。' }));
+  }
+
+  // 「今日の目標」の書き方・単位・できた数の欄・候補
+  function goalTools(b) {
+    const mode = b.goalMode || 'text';
+    const set = (patch) => { Object.assign(b, patch); save(); draw(); };
+    const unitIn = h('input', { class: 'unit-input', value: b.unit || '', maxlength: '8', 'aria-label': '単位' });
+    unitIn.addEventListener('change', () => set({ unit: unitIn.value.trim() }));
+    return h('div', { class: 'tool-group' },
+      h('span', { text: '目標の書き方' }),
+      h('div', { class: 'row' }, ...GOAL_MODES.map(([k, l]) => h('button', { class: `btn${mode === k ? ' on' : ''}`, onclick: () => set({ goalMode: k }) }, l))),
+      mode !== 'text' || b.showResult ? h('div', {},
+        h('span', { text: '単位' }),
+        h('div', { class: 'row' }, ...GOAL_UNITS.map((u) => h('button', { class: `btn small${b.unit === u ? ' on' : ''}`, onclick: () => set({ unit: u }) }, u)), unitIn)) : null,
+      h('span', { text: 'できた数の欄' }),
+      h('div', { class: 'row' },
+        h('button', { class: `btn${!b.showResult ? ' on' : ''}`, onclick: () => set({ showResult: false }) }, 'なし'),
+        h('button', { class: `btn${b.showResult ? ' on' : ''}`, onclick: () => set({ showResult: true }) }, 'あり')),
+      h('button', { class: 'btn', onclick: () => editGoalChoices(book) }, '🎯 目標の候補'));
   }
 
   function draw() {

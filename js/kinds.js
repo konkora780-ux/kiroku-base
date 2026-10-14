@@ -15,6 +15,7 @@ export const KINDS = [
   { kind: 'did', label: '取り組んだこと', icon: '✋', type: 'text' },
   { kind: 'result', label: 'できたこと', icon: '⭐', type: 'text' },
   { kind: 'growth', label: '成長・変化', icon: '🌱', type: 'text' },
+  { kind: 'counts', label: '数の記録', icon: '🔢', type: 'counts' },
   { kind: 'feeling', label: '感想', icon: '😊', type: 'choice' },
   { kind: 'next', label: '次回に向けて', icon: '➡️', type: 'text' },
   { kind: 'free', label: '自由記入', icon: '📝', type: 'text' },
@@ -22,6 +23,10 @@ export const KINDS = [
 ];
 
 export const RECOMMENDED = ['date', 'title', 'goal', 'photo', 'did', 'feeling', 'next'];
+
+// 「今日の目標」の書き方：文字だけ／数字だけ／文字＋数字（先生が様式で決める）
+export const GOAL_MODES = [['text', '文字'], ['number', '数字'], ['both', '文字＋数字']];
+export const GOAL_UNITS = ['回', 'まい', 'こ', '分', '秒', 'cm', 'm', 'ページ'];
 
 export function kindInfo(kind) {
   return KINDS.find((k) => k.kind === kind);
@@ -34,6 +39,9 @@ function newBlock(kind, x, y, w, h) {
   const info = kindInfo(kind);
   const b = { id: kind, kind, label: info.label, x, y, w, h, size: 'm' };
   if (kind === 'photo') b.photoCount = 1;
+  if (kind === 'goal') Object.assign(b, { goalMode: 'text', unit: '回', showResult: false });
+  // 数の記録：数える項目（例：葉の数・赤い実の数）は先生が足す
+  if (kind === 'counts') b.rows = [];
   if (kind === 'title') b.size = 'l';
   return b;
 }
@@ -69,11 +77,13 @@ function place(kinds, textH) {
   }
 
   // 残り：半分の幅の欄は左右に2つずつ。感想は全幅
-  const rest = ['did', 'result', 'growth', 'feeling', 'next', 'free', 'teacher'].filter((k) => has(k) && k !== side);
+  const rest = ['did', 'result', 'growth', 'counts', 'feeling', 'next', 'free', 'teacher'].filter((k) => has(k) && k !== side);
   let half = null; // 左半分だけ埋まっている行
+  // 相手のいない半分の欄は、横いっぱいに広げる（右に空白を残さない）
+  const widen = (b) => { if (b.x === 0) b.w = COLS; };
   for (const k of rest) {
     if (k === 'feeling') {
-      if (half) { y += half.h; half = null; }
+      if (half) { widen(half); y += half.h; half = null; }
       blocks.push(newBlock('feeling', 0, y, 6, 2));
       y += 2;
     } else if (half) {
@@ -88,7 +98,7 @@ function place(kinds, textH) {
       if (k === 'teacher') { y += textH; half = null; }
     }
   }
-  if (half) y += half.h;
+  if (half) { widen(half); y += half.h; }
   return { blocks, used: y };
 }
 
@@ -143,13 +153,48 @@ export function cloneLayout(layout) {
   return JSON.parse(JSON.stringify(layout));
 }
 
-// 「つぎの記録をつくる」で引き継げるもの
+export const hasNum = (n) => n !== undefined && n !== null && n !== '' && !Number.isNaN(Number(n));
+
+// 目標の欄を1行の文にする（一覧や引き継ぎの表示用）
+export function goalText(block, v) {
+  if (!v) return '';
+  const mode = (block && block.goalMode) || 'text';
+  const unit = (block && block.unit) || '';
+  const parts = [];
+  if (mode !== 'number' && v.text && v.text.trim()) parts.push(v.text.trim());
+  if (mode !== 'text' && hasNum(v.num)) parts.push(`目標 ${v.num}${unit}`);
+  if (block && block.showResult && hasNum(v.result)) parts.push(`できた ${v.result}${unit}`);
+  return parts.join('　');
+}
+
+// 数の記録の項目を1つ作る
+export function newCountRow(label, unit) {
+  return { id: 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), label, unit };
+}
+
+// 数の記録を1行の文にする（例：「葉の数 5まい・赤い実の数 2こ」）
+export function countsText(block, v) {
+  const nums = (v && v.nums) || {};
+  return ((block && block.rows) || [])
+    .filter((r) => hasNum(nums[r.id]))
+    .map((r) => `${r.label} ${nums[r.id]}${r.unit || ''}`)
+    .join('・');
+}
+
+// 「つぎの記録をつくる」で引き継げるもの（value は新しいページの目標欄に入れる中身。結果の数は引き継がない）
 export function carryOptions(layout, prevValues) {
-  const ids = new Set(layout.blocks.map((b) => b.kind));
-  const text = (k) => (prevValues && prevValues[k] && prevValues[k].text || '').trim();
+  const goal = layout.blocks.find((b) => b.kind === 'goal');
+  if (!goal) return [];
+  const mode = goal.goalMode || 'text';
+  const pv = prevValues || {};
+  const next = (pv.next && pv.next.text || '').trim();
+  const g = pv[goal.id] || {};
   const opts = [];
-  if (ids.has('goal') && text('next')) opts.push({ id: 'next2goal', label: '前回の「次回に向けて」を、今日の目標にする', text: text('next') });
-  if (ids.has('goal') && text('goal')) opts.push({ id: 'goal', label: '前回の「今日の目標」を、そのまま使う', text: text('goal') });
+  if (mode !== 'number' && next) opts.push({ id: 'next2goal', label: '前回の「次回に向けて」を、今日の目標にする', text: next, value: { text: next } });
+  const value = {};
+  if (mode !== 'number' && g.text && g.text.trim()) value.text = g.text.trim();
+  if (mode !== 'text' && hasNum(g.num)) value.num = Number(g.num);
+  if (Object.keys(value).length) opts.push({ id: 'goal', label: '前回の「今日の目標」を、そのまま使う', text: goalText({ ...goal, showResult: false }, value), value });
   return opts;
 }
 
